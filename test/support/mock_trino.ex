@@ -119,6 +119,31 @@ defmodule Trinox.MockTrino do
   @spec sql(atom()) :: String.t()
   def sql(scenario), do: Map.fetch!(@scenarios, Atom.to_string(scenario))
 
+  @doc """
+  `start!/1` options for serving the mock over TLS with the checked-in test certificate.
+
+  The certificate is signed by a throwaway CA, so clients need `ca_path/0` as their
+  `:cacertfile`. It is valid for both `localhost` and `127.0.0.1`.
+  """
+  @spec tls_opts() :: keyword()
+  def tls_opts, do: [scheme: :https, certfile: cert_path(), keyfile: key_path()]
+
+  @doc "Path to the CA that signed `cert_path/0`, for use as a client `:cacertfile`."
+  @spec ca_path() :: String.t()
+  def ca_path, do: Path.join(__DIR__, "tls/ca.pem")
+
+  @doc "Path to the certificate the mock serves over `:https`."
+  @spec cert_path() :: String.t()
+  def cert_path, do: Path.join(__DIR__, "tls/cert.pem")
+
+  @doc "Path to the private key for `cert_path/0`."
+  @spec key_path() :: String.t()
+  def key_path, do: Path.join(__DIR__, "tls/key.pem")
+
+  @doc "How long `GET /v1/slow` waits before responding, in milliseconds."
+  @spec slow_delay() :: pos_integer()
+  def slow_delay, do: 100
+
   @doc "The query id the mock reports for every query."
   @spec query_id() :: String.t()
   def query_id, do: @query_id
@@ -173,6 +198,15 @@ defmodule Trinox.MockTrino do
         "starting" => false,
         "nodeVersion" => %{"version" => "mock"}
       })
+    end
+
+    # Responds only after `Trinox.MockTrino.slow_delay/0`, for receive-timeout tests.
+    get "/v1/slow" do
+      Process.sleep(Trinox.MockTrino.slow_delay())
+
+      conn
+      |> record("")
+      |> json(%{"slow" => true})
     end
 
     match _ do

@@ -152,6 +152,14 @@ defmodule Trinox.MockTrinoTest do
       assert [%{method: "GET", path: "/v1/info"}] = MockTrino.requests(mock)
     end
 
+    test "GET /v1/slow answers only after the configured delay", %{mock: mock} do
+      {elapsed, {200, _headers, body}} =
+        :timer.tc(fn -> get(MockTrino.base_url(mock) <> "/v1/slow") end, :millisecond)
+
+      assert body == %{"slow" => true}
+      assert elapsed >= MockTrino.slow_delay()
+    end
+
     test "unknown paths are 404s", %{mock: mock} do
       assert {404, _headers, "not found"} = get(MockTrino.base_url(mock) <> "/nope")
     end

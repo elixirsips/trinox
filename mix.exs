@@ -33,6 +33,7 @@ defmodule Trinox.MixProject do
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:mint, "~> 1.0"},
       {:jason, "~> 1.4"},
+      {:castore, "~> 1.0"},
       {:bandit, "~> 1.5", only: :test},
       {:plug, "~> 1.16", only: :test}
     ]

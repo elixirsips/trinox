@@ -8,7 +8,8 @@ defmodule Trinox.MixProject do
       elixir: "~> 1.18",
       start_permanent: Mix.env() == :prod,
       deps: deps(),
-      aliases: aliases()
+      aliases: aliases(),
+      test_coverage: [tool: ExCoveralls]
     ]
   end
 
@@ -29,9 +30,27 @@ defmodule Trinox.MixProject do
     ]
   end
 
+  def cli do
+    [
+      preferred_envs: [
+        coveralls: :test,
+        "coveralls.detail": :test,
+        "coveralls.post": :test,
+        "coveralls.html": :test,
+        "coveralls.cobertura": :test,
+        docs: :docs
+      ]
+    ]
+  end
+
   defp aliases do
     [
-      lint: ["format --check-formatted", "credo --strict"]
+      lint: [
+        "compile --warnings-as-errors --force",
+        "format --check-formatted",
+        "deps.unlock --unused",
+        "credo  --strict"
+      ]
     ]
   end
 end

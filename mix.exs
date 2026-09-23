@@ -26,7 +26,8 @@ defmodule Trinox.MixProject do
     [
       {:excoveralls, "~> 0.18.5", only: :test},
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
-      {:credo, "~> 1.7", only: [:dev, :test], runtime: false}
+      {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
+      {:mint, "~> 1.0"}
     ]
   end
 

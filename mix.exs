@@ -7,7 +7,8 @@ defmodule Trinox.MixProject do
       version: "0.1.0",
       elixir: "~> 1.18",
       start_permanent: Mix.env() == :prod,
-      deps: deps()
+      deps: deps(),
+      aliases: aliases()
     ]
   end
 
@@ -25,6 +26,12 @@ defmodule Trinox.MixProject do
       {:excoveralls, "~> 0.18.5", only: :test},
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false}
+    ]
+  end
+
+  defp aliases do
+    [
+      lint: ["format --check-formatted", "credo --strict"]
     ]
   end
 end

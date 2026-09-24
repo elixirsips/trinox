@@ -1,0 +1,166 @@
+defmodule Trinox.StatementTest do
+  use ExUnit.Case, async: true
+
+  alias Trinox.HTTP
+  alias Trinox.MockTrino
+  alias Trinox.Statement
+
+  @headers [{"x-trino-user", "alice"}]
+
+  setup do
+    mock = MockTrino.start!()
+    {:ok, conn} = HTTP.connect(:http, "127.0.0.1", mock.port)
+    {:ok, mock: mock, conn: conn}
+  end
+
+  describe "run/4" do
+    test "polls a queued query through to its terminal page", %{mock: mock, conn: conn} do
+      assert {:ok, _conn, [queued, final]} =
+               Statement.run(conn, MockTrino.sql(:single), @headers, [])
+
+      assert queued["stats"]["state"] == "QUEUED"
+      refute Map.has_key?(queued, "columns")
+
+      assert final["stats"]["state"] == "FINISHED"
+      assert final["data"] == [[1, "one"]]
+      refute Map.has_key?(final, "nextUri")
+
+      assert [%{method: "POST"}, %{method: "GET"}] = MockTrino.requests(mock)
+    end
+
+    test "accumulates every page of a multi-page query in order", %{mock: mock, conn: conn} do
+      assert {:ok, _conn, pages} =
+               Statement.run(conn, MockTrino.sql(:multi_page), @headers, [])
+
+      assert length(pages) == 4
+
+      assert Enum.flat_map(pages, &Map.get(&1, "data", [])) == [
+               [1, "one"],
+               [2, "two"],
+               [3, "three"]
+             ]
+
+      # Columns arrive once, on the first page that has any.
+      assert Enum.count(pages, &Map.has_key?(&1, "columns")) == 1
+      refute Map.has_key?(List.last(pages), "nextUri")
+
+      assert length(MockTrino.requests(mock)) == 4
+    end
+
+    test "follows a nextUri that carries a query string", %{mock: mock, conn: conn} do
+      {:ok, _conn, [_queued, first | _rest]} =
+        Statement.run(conn, MockTrino.sql(:multi_page), @headers, [])
+
+      assert first["nextUri"] =~ "?slug=mock"
+
+      paths = mock |> MockTrino.requests() |> Enum.map(& &1.path) |> Enum.uniq()
+      assert Enum.all?(paths, &(not String.contains?(&1, "?")))
+      assert Enum.any?(paths, &String.starts_with?(&1, "/v1/statement/multi_page/"))
+    end
+
+    test "stops at a page that reports an error", %{conn: conn} do
+      assert {:ok, _conn, pages} = Statement.run(conn, MockTrino.sql(:error), @headers, [])
+
+      final = List.last(pages)
+      assert final["error"]["errorName"] == "TABLE_NOT_FOUND"
+      assert final["stats"]["state"] == "FAILED"
+    end
+
+    test "does not poll when the POST response is already terminal", %{mock: mock, conn: conn} do
+      assert {:ok, _conn, [only_page]} =
+               Statement.run(conn, MockTrino.sql(:immediate), @headers, [])
+
+      assert only_page["data"] == [[1, "one"]]
+      assert [%{method: "POST"}] = MockTrino.requests(mock)
+    end
+
+    test "sends the given headers on the POST and on every poll", %{mock: mock, conn: conn} do
+      headers = [{"x-trino-user", "alice"}, {"x-trino-catalog", "tpch"}]
+
+      {:ok, _conn, _pages} = Statement.run(conn, MockTrino.sql(:multi_page), headers, [])
+
+      for request <- MockTrino.requests(mock) do
+        assert MockTrino.header(request, "x-trino-user") == "alice"
+        assert MockTrino.header(request, "x-trino-catalog") == "tpch"
+      end
+    end
+
+    test "sends the statement as the POST body", %{mock: mock, conn: conn} do
+      statement = MockTrino.sql(:single)
+      {:ok, _conn, _pages} = Statement.run(conn, statement, @headers, [])
+
+      assert [post | _polls] = MockTrino.requests(mock)
+      assert post.body == statement
+    end
+
+    test "waits between polls when :poll_interval_ms is set", %{conn: conn} do
+      {elapsed, {:ok, _conn, pages}} =
+        :timer.tc(
+          fn ->
+            Statement.run(conn, MockTrino.sql(:multi_page), @headers, poll_interval_ms: 20)
+          end,
+          :millisecond
+        )
+
+      assert length(pages) == 4
+      # Three polls follow the POST, each waiting first.
+      assert elapsed >= 60
+    end
+
+    test "passes :receive_timeout through to each request", %{conn: conn} do
+      assert {:error, _conn, %Mint.TransportError{reason: :timeout}} =
+               Statement.run(conn, MockTrino.sql(:slow), @headers, receive_timeout: 1)
+    end
+  end
+
+  describe "run/4 failures" do
+    test "returns the transport error when the POST cannot be sent", %{conn: conn} do
+      {:ok, conn} = HTTP.close(conn)
+
+      assert {:error, _conn, %Mint.HTTPError{reason: :closed}} =
+               Statement.run(conn, MockTrino.sql(:single), @headers, [])
+    end
+
+    test "returns the transport error when a poll fails", %{mock: mock, conn: conn} do
+      # Let the POST through, then take the coordinator away before the first poll.
+      spawn_link(fn ->
+        Process.sleep(5)
+        MockTrino.stop(mock)
+      end)
+
+      assert {:error, _conn, _reason} =
+               Statement.run(conn, MockTrino.sql(:multi_page), @headers, poll_interval_ms: 50)
+    end
+
+    test "rejects a non-2xx answer", %{conn: conn} do
+      assert {:error, _conn, %RuntimeError{message: message}} =
+               Statement.run(conn, MockTrino.sql(:unavailable), @headers, [])
+
+      assert message =~ "HTTP 503"
+      assert message =~ "Service Unavailable"
+    end
+
+    test "rejects a body that is not JSON", %{conn: conn} do
+      assert {:error, _conn, %Jason.DecodeError{}} =
+               Statement.run(conn, MockTrino.sql(:invalid_json), @headers, [])
+    end
+  end
+
+  describe "terminal?/1" do
+    test "a page without a nextUri ends the query" do
+      assert Statement.terminal?(%{"id" => "q", "data" => []})
+    end
+
+    test "a page with a nextUri does not" do
+      refute Statement.terminal?(%{"id" => "q", "nextUri" => "http://host/v1/statement/q/1"})
+    end
+
+    test "an error ends the query even with a nextUri" do
+      assert Statement.terminal?(%{
+               "id" => "q",
+               "nextUri" => "http://host/v1/statement/q/1",
+               "error" => %{"message" => "boom"}
+             })
+    end
+  end
+end

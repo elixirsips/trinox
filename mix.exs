@@ -34,6 +34,7 @@ defmodule Trinox.MixProject do
       {:mint, "~> 1.0"},
       {:jason, "~> 1.4"},
       {:castore, "~> 1.0"},
+      {:db_connection, "~> 2.7"},
       {:bandit, "~> 1.5", only: :test},
       {:plug, "~> 1.16", only: :test}
     ]

@@ -61,17 +61,23 @@ defmodule Trinox.MockTrino do
   @doc """
   Starts the mock and links it to the calling process.
 
-  Options: `:scheme` (`:http`, the default, or `:https`), plus `:certfile` and
-  `:keyfile` which are passed through to `Bandit` for `:https`.
+  Options:
+
+    * `:scheme` — `:http` (the default) or `:https`, with `:certfile`/`:keyfile`
+      passed through to `Bandit`.
+    * `:info_status` — the status `GET /v1/info` answers with (default `200`), for
+      simulating a coordinator that is unreachable or still starting.
   """
   @spec start!(keyword()) :: t()
   def start!(opts \\ []) do
     {:ok, recorder} = Agent.start_link(fn -> [] end)
 
+    plug_opts = Keyword.merge([recorder: recorder], Keyword.take(opts, [:info_status]))
+
     bandit_opts =
       Keyword.merge(
         [
-          plug: {__MODULE__.Router, recorder: recorder},
+          plug: {__MODULE__.Router, plug_opts},
           scheme: :http,
           port: 0,
           startup_log: false
@@ -191,22 +197,23 @@ defmodule Trinox.MockTrino do
     end
 
     get "/v1/info" do
-      conn
-      |> record("")
-      |> json(%{
+      info = %{
         "coordinator" => true,
         "starting" => false,
         "nodeVersion" => %{"version" => "mock"}
-      })
+      }
+
+      conn
+      |> record("")
+      |> json(info, Keyword.get(conn.assigns.mock_trino, :info_status, 200))
     end
 
     # Responds only after `Trinox.MockTrino.slow_delay/0`, for receive-timeout tests.
     get "/v1/slow" do
+      # Record first: a client that gives up on the delay takes the mock down with it.
+      conn = record(conn, "")
       Process.sleep(Trinox.MockTrino.slow_delay())
-
-      conn
-      |> record("")
-      |> json(%{"slow" => true})
+      json(conn, %{"slow" => true})
     end
 
     match _ do
@@ -325,10 +332,10 @@ defmodule Trinox.MockTrino do
       Enum.reduce(headers, conn, fn {name, value}, acc -> put_resp_header(acc, name, value) end)
     end
 
-    defp json(conn, body) do
+    defp json(conn, body, status \\ 200) do
       conn
       |> put_resp_content_type("application/json")
-      |> send_resp(200, Jason.encode!(body))
+      |> send_resp(status, Jason.encode!(body))
     end
   end
 end

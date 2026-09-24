@@ -102,6 +102,7 @@ defmodule Trinox.HTTPTest do
       assert %Mint.HTTPError{module: Mint.HTTP2, reason: {:server_closed_request, _code}} = reason
     end
 
+    @tag :capture_log
     test "rejects the fixture certificate when only the default CAs are trusted", %{mock: mock} do
       assert {:error, %Mint.TransportError{reason: {:tls_alert, {alert, _detail}}}} =
                HTTP.connect(:https, "localhost", mock.port)

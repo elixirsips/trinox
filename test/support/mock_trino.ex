@@ -22,6 +22,13 @@ defmodule Trinox.MockTrino do
     * `:session` — the `POST` response sets catalog, schema and a session property;
       the terminal page sets one more, so tests can check that *every* page is applied.
     * `:clear_session` — the terminal page clears a session property.
+    * `:unavailable` — the `POST` is answered with `503`, as a busy coordinator does.
+    * `:invalid_json` — the `POST` is answered with `200` and a broken JSON body.
+    * `:slow` — the `POST` is answered only after `slow_delay/0`, then behaves like
+      `:single`.
+
+  `:multi_page` hands back a `nextUri` carrying a query string, since a `nextUri` is
+  opaque and has to be followed exactly as given.
 
   ## Example
 
@@ -55,7 +62,10 @@ defmodule Trinox.MockTrino do
     "multi_page" => "SELECT * FROM multi_page",
     "error" => "SELECT * FROM boom",
     "session" => "SET SESSION mock_scenario = 'session'",
-    "clear_session" => "RESET SESSION mock_scenario"
+    "clear_session" => "RESET SESSION mock_scenario",
+    "unavailable" => "SELECT * FROM unavailable",
+    "invalid_json" => "SELECT * FROM garbage",
+    "slow" => "SELECT * FROM slow"
   }
 
   @doc """
@@ -185,7 +195,7 @@ defmodule Trinox.MockTrino do
 
       conn
       |> record(body)
-      |> respond(Trinox.MockTrino.scenario_for(body), 0)
+      |> submit(Trinox.MockTrino.scenario_for(body))
     end
 
     get "/v1/statement/:scenario/:query_id/:token" do
@@ -233,6 +243,21 @@ defmodule Trinox.MockTrino do
       Agent.update(Keyword.fetch!(conn.assigns.mock_trino, :recorder), &[request | &1])
       conn
     end
+
+    defp submit(conn, "unavailable"), do: send_resp(conn, 503, "Service Unavailable")
+
+    defp submit(conn, "invalid_json") do
+      conn
+      |> put_resp_content_type("application/json")
+      |> send_resp(200, "{\"id\": truncated")
+    end
+
+    defp submit(conn, "slow") do
+      Process.sleep(Trinox.MockTrino.slow_delay())
+      respond(conn, "single", 0)
+    end
+
+    defp submit(conn, scenario), do: respond(conn, scenario, 0)
 
     defp respond(conn, scenario, token) do
       %{body: body, headers: headers} = page = page(scenario, token)
@@ -290,6 +315,9 @@ defmodule Trinox.MockTrino do
 
     defp maybe_put_next_uri(body, %{next?: true}, conn, scenario, token) do
       next = "#{base(conn)}/v1/statement/#{scenario}/#{Trinox.MockTrino.query_id()}/#{token + 1}"
+      # A nextUri is opaque: multi_page hangs a query string off it to prove clients
+      # follow it verbatim instead of rebuilding the path.
+      next = if scenario == "multi_page", do: next <> "?slug=mock", else: next
       Map.put(body, "nextUri", next)
     end
 

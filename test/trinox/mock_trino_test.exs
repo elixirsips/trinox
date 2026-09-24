@@ -27,6 +27,23 @@ defmodule Trinox.MockTrinoTest do
       assert body["nextUri"] =~ "/v1/statement/single/"
     end
 
+    test "the slow scenario answers only after the configured delay", %{mock: mock} do
+      {elapsed, {200, _headers, body}} =
+        :timer.tc(fn -> submit(mock, MockTrino.sql(:slow)) end, :millisecond)
+
+      assert elapsed >= MockTrino.slow_delay()
+      assert body["nextUri"] =~ "/v1/statement/single/"
+    end
+
+    test "the unavailable scenario answers 503", %{mock: mock} do
+      assert {503, _headers, "Service Unavailable"} = submit(mock, MockTrino.sql(:unavailable))
+    end
+
+    test "the invalid_json scenario answers with a broken body", %{mock: mock} do
+      assert {200, _headers, body} = submit(mock, MockTrino.sql(:invalid_json))
+      assert {:error, %Jason.DecodeError{}} = Jason.decode(body)
+    end
+
     test "the immediate scenario is already terminal", %{mock: mock} do
       {200, _headers, body} = submit(mock, MockTrino.sql(:immediate))
 
@@ -200,8 +217,16 @@ defmodule Trinox.MockTrinoTest do
 
   defp decode(headers, body) do
     case resp_header(headers, "content-type") do
-      "application/json" <> _rest -> Jason.decode!(body)
+      "application/json" <> _rest -> decode_json(body)
       _other -> body
+    end
+  end
+
+  # The invalid_json scenario serves a JSON content type with a body that isn't.
+  defp decode_json(body) do
+    case Jason.decode(body) do
+      {:ok, decoded} -> decoded
+      {:error, _reason} -> body
     end
   end
 

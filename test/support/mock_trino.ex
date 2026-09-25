@@ -26,6 +26,8 @@ defmodule Trinox.MockTrino do
     * `:invalid_json` — the `POST` is answered with `200` and a broken JSON body.
     * `:slow` — the `POST` is answered only after `slow_delay/0`, then behaves like
       `:single`.
+    * `:closing` — the `POST` is answered with `Connection: close`, so the connection is
+      gone by the time the poll is sent and the poll fails outright.
 
   `:multi_page` hands back a `nextUri` carrying a query string, since a `nextUri` is
   opaque and has to be followed exactly as given.
@@ -65,7 +67,8 @@ defmodule Trinox.MockTrino do
     "clear_session" => "RESET SESSION mock_scenario",
     "unavailable" => "SELECT * FROM unavailable",
     "invalid_json" => "SELECT * FROM garbage",
-    "slow" => "SELECT * FROM slow"
+    "slow" => "SELECT * FROM slow",
+    "closing" => "SELECT * FROM closing"
   }
 
   @doc """
@@ -276,6 +279,10 @@ defmodule Trinox.MockTrino do
     # Token 0 is the POST /v1/statement response.
     defp page("immediate", 0), do: done(%{"columns" => columns(), "data" => [[1, "one"]]})
     defp page("session", 0), do: with_headers(queued(), @set_session_headers)
+
+    # A nextUri the client can never follow: Bandit closes the connection after this
+    # response, so the poll fails on a dead socket instead of on a stopwatch.
+    defp page("closing", 0), do: with_headers(queued(), [{"connection", "close"}])
     defp page(_scenario, 0), do: queued()
 
     defp page("multi_page", 1), do: more(%{"columns" => columns(), "data" => [[1, "one"]]})

@@ -122,14 +122,13 @@ defmodule Trinox.StatementTest do
     end
 
     test "returns the transport error when a poll fails", %{mock: mock, conn: conn} do
-      # Let the POST through, then take the coordinator away before the first poll.
-      spawn_link(fn ->
-        Process.sleep(5)
-        MockTrino.stop(mock)
-      end)
+      # The POST is answered with `Connection: close`, so the coordinator is already gone
+      # when the poll is sent — no sleeps and nothing to lose a race to. Only the POST
+      # reaches the mock, which is what says the failure happened on the poll.
+      assert {:error, _conn, %Mint.HTTPError{reason: :closed}} =
+               Statement.run(conn, MockTrino.sql(:closing), @headers, [])
 
-      assert {:error, _conn, _reason} =
-               Statement.run(conn, MockTrino.sql(:multi_page), @headers, poll_interval_ms: 50)
+      assert [%{method: "POST"}] = MockTrino.requests(mock)
     end
 
     test "rejects a non-2xx answer", %{conn: conn} do

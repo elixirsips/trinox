@@ -15,7 +15,7 @@ defmodule Trinox.StatementTest do
 
   describe "run/4" do
     test "polls a queued query through to its terminal page", %{mock: mock, conn: conn} do
-      assert {:ok, _conn, [queued, final]} =
+      assert {:ok, _conn, [queued, final], _headers} =
                Statement.run(conn, MockTrino.sql(:single), @headers, [])
 
       assert queued["stats"]["state"] == "QUEUED"
@@ -29,7 +29,7 @@ defmodule Trinox.StatementTest do
     end
 
     test "accumulates every page of a multi-page query in order", %{mock: mock, conn: conn} do
-      assert {:ok, _conn, pages} =
+      assert {:ok, _conn, pages, _headers} =
                Statement.run(conn, MockTrino.sql(:multi_page), @headers, [])
 
       assert length(pages) == 4
@@ -48,7 +48,7 @@ defmodule Trinox.StatementTest do
     end
 
     test "follows a nextUri that carries a query string", %{mock: mock, conn: conn} do
-      {:ok, _conn, [_queued, first | _rest]} =
+      {:ok, _conn, [_queued, first | _rest], _headers} =
         Statement.run(conn, MockTrino.sql(:multi_page), @headers, [])
 
       assert first["nextUri"] =~ "?slug=mock"
@@ -59,7 +59,8 @@ defmodule Trinox.StatementTest do
     end
 
     test "stops at a page that reports an error", %{conn: conn} do
-      assert {:ok, _conn, pages} = Statement.run(conn, MockTrino.sql(:error), @headers, [])
+      assert {:ok, _conn, pages, _headers} =
+               Statement.run(conn, MockTrino.sql(:error), @headers, [])
 
       final = List.last(pages)
       assert final["error"]["errorName"] == "TABLE_NOT_FOUND"
@@ -67,7 +68,7 @@ defmodule Trinox.StatementTest do
     end
 
     test "does not poll when the POST response is already terminal", %{mock: mock, conn: conn} do
-      assert {:ok, _conn, [only_page]} =
+      assert {:ok, _conn, [only_page], _headers} =
                Statement.run(conn, MockTrino.sql(:immediate), @headers, [])
 
       assert only_page["data"] == [[1, "one"]]
@@ -77,7 +78,8 @@ defmodule Trinox.StatementTest do
     test "sends the given headers on the POST and on every poll", %{mock: mock, conn: conn} do
       headers = [{"x-trino-user", "alice"}, {"x-trino-catalog", "tpch"}]
 
-      {:ok, _conn, _pages} = Statement.run(conn, MockTrino.sql(:multi_page), headers, [])
+      {:ok, _conn, _pages, _headers} =
+        Statement.run(conn, MockTrino.sql(:multi_page), headers, [])
 
       for request <- MockTrino.requests(mock) do
         assert MockTrino.header(request, "x-trino-user") == "alice"
@@ -87,14 +89,14 @@ defmodule Trinox.StatementTest do
 
     test "sends the statement as the POST body", %{mock: mock, conn: conn} do
       statement = MockTrino.sql(:single)
-      {:ok, _conn, _pages} = Statement.run(conn, statement, @headers, [])
+      {:ok, _conn, _pages, _headers} = Statement.run(conn, statement, @headers, [])
 
       assert [post | _polls] = MockTrino.requests(mock)
       assert post.body == statement
     end
 
     test "waits between polls when :poll_interval_ms is set", %{conn: conn} do
-      {elapsed, {:ok, _conn, pages}} =
+      {elapsed, {:ok, _conn, pages, _headers}} =
         :timer.tc(
           fn ->
             Statement.run(conn, MockTrino.sql(:multi_page), @headers, poll_interval_ms: 20)
@@ -110,6 +112,21 @@ defmodule Trinox.StatementTest do
     test "passes :receive_timeout through to each request", %{conn: conn} do
       assert {:error, _conn, %Mint.TransportError{reason: :timeout}} =
                Statement.run(conn, MockTrino.sql(:slow), @headers, receive_timeout: 1)
+    end
+
+    test "returns every page's response headers in the order they arrived", %{conn: conn} do
+      assert {:ok, _conn, _pages, headers} =
+               Statement.run(conn, MockTrino.sql(:session), @headers, [])
+
+      # The POST response sets catalog, schema and a property; the terminal page sets one
+      # more, and a caller folding a session needs both.
+      assert Enum.filter(headers, &match?({"x-trino-set-session", _value}, &1)) == [
+               {"x-trino-set-session", "mock_scenario=session"},
+               {"x-trino-set-session", "mock_page_prop=2"}
+             ]
+
+      assert {"x-trino-set-catalog", "memory"} in headers
+      assert {"x-trino-set-schema", "default"} in headers
     end
   end
 

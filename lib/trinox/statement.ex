@@ -9,8 +9,9 @@ defmodule Trinox.Statement do
   failed).
 
   This module does that walk and nothing else: it returns the raw decoded JSON pages in
-  the order they arrived. Turning them into a result is `Trinox.ResultDecoder`'s job,
-  and reading the `X-Trino-Set-*` response headers is `Trinox.Session`'s.
+  the order they arrived, along with the response headers that came with them. Turning
+  the pages into a result is `Trinox.ResultDecoder`'s job, and reading the
+  `X-Trino-Set-*` headers is `Trinox.Session`'s.
 
   A failed query is *not* an error here — it is a normal terminal page that happens to
   carry an `"error"` key, and the caller decides what to make of it. The `{:error, ...}`
@@ -39,10 +40,13 @@ defmodule Trinox.Statement do
       `nextUri` already long-polls server-side).
     * `:receive_timeout` — per-request, passed to `Trinox.HTTP.request/6`.
 
-  Returns every page, starting with the `POST` response.
+  Returns every page, starting with the `POST` response, and every page's response
+  headers concatenated in the order they arrived. Concatenating them loses nothing that
+  `Trinox.Session.apply_response_headers/2` needs: it folds headers in order, so folding
+  the whole run at once says exactly what folding page by page would have.
   """
   @spec run(HTTP.conn(), String.t(), HTTP.headers(), keyword()) ::
-          {:ok, HTTP.conn(), [page()]} | {:error, HTTP.conn(), Exception.t()}
+          {:ok, HTTP.conn(), [page()], HTTP.headers()} | {:error, HTTP.conn(), Exception.t()}
   def run(conn, statement, headers, opts) do
     case HTTP.request(conn, "POST", @statement_path, headers, statement, request_opts(opts)) do
       {:ok, conn, response} -> collect(conn, response, headers, opts, [])
@@ -64,7 +68,7 @@ defmodule Trinox.Statement do
   defp collect(conn, %{status: status} = response, headers, opts, pages)
        when status in 200..299 do
     case Jason.decode(response.body) do
-      {:ok, page} -> advance(conn, page, headers, opts, pages)
+      {:ok, page} -> advance(conn, {page, response.headers}, headers, opts, pages)
       {:error, reason} -> {:error, conn, reason}
     end
   end
@@ -73,14 +77,22 @@ defmodule Trinox.Statement do
     {:error, conn, status_error(response)}
   end
 
-  defp advance(conn, page, headers, opts, pages) do
-    pages = [page | pages]
+  # Pages are accumulated with the headers they arrived with, and split apart at the end,
+  # so that a caller threading a session gets the headers of every page rather than only
+  # the last one's.
+  defp advance(conn, {page, _response_headers} = arrival, headers, opts, pages) do
+    pages = [arrival | pages]
 
     if terminal?(page) do
-      {:ok, conn, Enum.reverse(pages)}
+      finish(conn, pages)
     else
       do_poll(conn, page["nextUri"], headers, opts, pages)
     end
+  end
+
+  defp finish(conn, pages) do
+    {pages, headers} = pages |> Enum.reverse() |> Enum.unzip()
+    {:ok, conn, pages, Enum.concat(headers)}
   end
 
   defp do_poll(conn, next_uri, headers, opts, pages) do

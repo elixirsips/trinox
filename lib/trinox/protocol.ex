@@ -18,7 +18,8 @@ defmodule Trinox.Protocol do
 
     * `:username` — required; used as `X-Trino-User` and as the Basic-auth user.
     * `:password` — optional; when given, requests carry `Authorization: Basic ...`.
-      Trino only accepts Basic auth over TLS, so this belongs with `scheme: :https`.
+      Basic auth is a reversible encoding rather than encryption, so it is refused
+      outright with `scheme: :http`; it requires `scheme: :https`, as Trino does.
     * `:scheme` — `:http` or `:https` (default `:https`).
     * `:hostname` — default `"localhost"`.
     * `:port` — default `default_port/1` for the scheme.
@@ -105,6 +106,7 @@ defmodule Trinox.Protocol do
   def validate(opts) do
     with :ok <- validate_username(opts),
          :ok <- validate_scheme(opts),
+         :ok <- validate_password(opts),
          :ok <- validate_hostname(opts) do
       validate_port(opts)
     end
@@ -198,6 +200,22 @@ defmodule Trinox.Protocol do
       {:ok, scheme} when scheme in [:http, :https] -> :ok
       {:ok, other} -> invalid(:scheme, other, "the atom :http or :https")
       :error -> :ok
+    end
+  end
+
+  # HTTP Basic auth is the password in base64, which is not encryption. Sending one over
+  # `:http` puts it on the wire for anything in between to read, and Trino rejects Basic
+  # auth over plain HTTP anyway — so this is refused rather than merely warned about.
+  defp validate_password(opts) do
+    if Keyword.has_key?(opts, :password) and Keyword.get(opts, :scheme, :https) == :http do
+      {:error,
+       %ArgumentError{
+         message:
+           "Trinox will not send a :password over :http — HTTP Basic auth would carry it " <>
+             "in cleartext. Use scheme: :https, which Trino requires for Basic auth."
+       }}
+    else
+      :ok
     end
   end
 

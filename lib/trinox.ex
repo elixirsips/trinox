@@ -42,7 +42,7 @@ defmodule Trinox do
   `:connect_timeout`, `:receive_timeout`, `:poll_interval_ms` — plus `:name` and the
   other `GenServer.start_link/3` options, which name the connection process.
 
-  `query/3` takes `:timeout` (default `:infinity`), which bounds the whole query, plus
+  `query/4` takes `:timeout` (default `:infinity`), which bounds the whole query, plus
   `:receive_timeout` and `:poll_interval_ms`, which override the connection's for that one
   query. A query that runs past its `:timeout` is cancelled on the coordinator and
   returns a `Trinox.Error`, leaving the connection free for the next caller — an
@@ -58,6 +58,14 @@ defmodule Trinox do
       ]
 
   A named connection is then queried by that name: `Trinox.query(MyApp.Trino, sql)`.
+
+  ## Parameters
+
+  `query/4` and `query!/4` take parameters in third place and options in fourth, the shape
+  `Postgrex.query/4` uses. Binding is not implemented — Trino does it with `PREPARE` and
+  `EXECUTE` rather than on the statement itself — so `params` must be `[]` for now. The
+  argument exists so that implementing binding later is not a breaking change to the one
+  function every caller uses.
   """
 
   alias Trinox.Connection
@@ -83,6 +91,10 @@ defmodule Trinox do
   @doc """
   Runs `statement` on `conn` and waits for it to finish.
 
+  `params` is the third argument and options the fourth, as in `Postgrex.query/4`.
+  Parameter binding is not implemented yet, so `params` must be `[]` — the argument is
+  here now so that adding binding later does not move `opts` and break every call site.
+
   Returns `{:error, %Trinox.Error{}}` for a query Trino refused — a missing table, a
   syntax error, a query that ran out of resources — since Trino reports those in the
   result rather than by failing the request. Other errors mean the conversation with the
@@ -97,17 +109,24 @@ defmodule Trinox do
       result.columns
       #=> ["name"]
   """
-  @spec query(conn(), String.t(), keyword()) :: {:ok, Result.t()} | {:error, Exception.t()}
-  def query(conn, statement, opts \\ []), do: Connection.query(conn, statement, opts)
+  @spec query(conn(), String.t(), list(), keyword()) ::
+          {:ok, Result.t()} | {:error, Exception.t()}
+  def query(conn, statement, params \\ [], opts \\ [])
+
+  def query(conn, statement, [], opts), do: Connection.query(conn, statement, opts)
+
+  def query(_conn, statement, params, _opts) do
+    raise ArgumentError, unsupported_params(params, statement)
+  end
 
   @doc """
   Runs `statement` on `conn` and returns the `Trinox.Result`, raising on failure.
 
-  Same as `query/3` otherwise.
+  Same as `query/4` otherwise.
   """
-  @spec query!(conn(), String.t(), keyword()) :: Result.t()
-  def query!(conn, statement, opts \\ []) do
-    case query(conn, statement, opts) do
+  @spec query!(conn(), String.t(), list(), keyword()) :: Result.t()
+  def query!(conn, statement, params \\ [], opts \\ []) do
+    case query(conn, statement, params, opts) do
       {:ok, result} -> result
       {:error, error} -> raise error
     end
@@ -173,6 +192,19 @@ defmodule Trinox do
   """
   @spec ping(conn(), keyword()) :: :ok | {:error, Exception.t()}
   def ping(conn, opts \\ []), do: Connection.ping(conn, opts)
+
+  # Parameters have a place in the signature but nothing behind them yet. A keyword list
+  # here is almost always options that landed one argument early, so it is worth saying so
+  # rather than reporting it as an unsupported parameter list.
+  defp unsupported_params(params, statement) do
+    if Keyword.keyword?(params) do
+      "Trinox.query/4 takes parameters third and options fourth, and #{inspect(params)} " <>
+        "looks like options; pass them as Trinox.query(conn, sql, [], #{inspect(params)})"
+    else
+      "Trinox does not support query parameters yet, got #{inspect(params)} " <>
+        "for #{inspect(statement)}"
+    end
+  end
 
   defp run_transaction(conn, fun, opts) do
     fun.(conn)

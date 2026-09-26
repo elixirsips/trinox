@@ -10,7 +10,7 @@ defmodule Trinox.Connection do
   Queries run in this process, so a query holds the connection for as long as it takes
   Trino to finish it; a caller that needs two queries at once needs two connections.
 
-  `Trinox.start_link/1` and `Trinox.query/3` are the public face of this module — reach
+  `Trinox.start_link/1` and `Trinox.query/4` are the public face of this module — reach
   for it directly only to start a connection without `Trinox`'s option handling.
 
   ## Starting up, and staying up

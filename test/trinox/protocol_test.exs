@@ -5,9 +5,9 @@ defmodule Trinox.ProtocolTest do
   alias Trinox.HTTP
   alias Trinox.MockTrino
   alias Trinox.Protocol
+  alias Trinox.Query
   alias Trinox.Result
   alias Trinox.Session
-  alias Trinox.TestQuery
 
   setup do
     mock = MockTrino.start!()
@@ -377,7 +377,7 @@ defmodule Trinox.ProtocolTest do
     end
   end
 
-  defp query(scenario), do: %TestQuery{statement: MockTrino.sql(scenario)}
+  defp query(scenario), do: %Query{statement: MockTrino.sql(scenario)}
 
   defp opts(mock) do
     [scheme: :http, hostname: "127.0.0.1", port: mock.port, username: "alice"]

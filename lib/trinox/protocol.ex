@@ -74,7 +74,7 @@ defmodule Trinox.Protocol do
   @typedoc """
   Anything carrying the statement to run.
 
-  `Trinox.Query` fills this in a later issue; nothing here needs more than the SQL.
+  `Trinox.Query` is what the public API builds; nothing here needs more than the SQL.
   """
   @type query :: %{:statement => String.t(), optional(any()) => any()}
 

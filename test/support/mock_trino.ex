@@ -124,7 +124,12 @@ defmodule Trinox.MockTrino do
           plug: {__MODULE__.Router, plug_opts},
           scheme: :http,
           port: 0,
-          startup_log: false
+          startup_log: false,
+          # One acceptor, not ThousandIsland's default hundred. A mock serves one client's
+          # requests one after another, so the other ninety-nine do nothing but spawn and
+          # then, when the mock goes down with its test, race the server they report to and
+          # log a crash each. A hundred of those per mock buries a CI log.
+          thousand_island_options: [num_acceptors: 1]
         ],
         Keyword.take(opts, [:scheme, :certfile, :keyfile, :port])
       )

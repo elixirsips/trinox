@@ -1,6 +1,7 @@
 defmodule Trinox.StatementTest do
   use ExUnit.Case, async: true
 
+  alias Trinox.Error
   alias Trinox.HTTP
   alias Trinox.MockTrino
   alias Trinox.Statement
@@ -130,6 +131,136 @@ defmodule Trinox.StatementTest do
     end
   end
 
+  describe "run/4 deadlines" do
+    test "cancels the query and stops polling once the deadline passes",
+         %{mock: mock, conn: conn} do
+      # Warm the connection first: the deadline caps the timeout of the request it covers,
+      # so a cold first POST on a loaded machine can eat the budget before there is a query
+      # to cancel at all.
+      {:ok, conn, _warm, _headers} = Statement.run(conn, MockTrino.sql(:single), @headers, [])
+
+      assert {:error, conn, %Error{message: message}} =
+               Statement.run(conn, MockTrino.sql(:endless), @headers,
+                 poll_interval_ms: 60_000,
+                 deadline: in_ms(500)
+               )
+
+      assert message =~ ":timeout"
+
+      # The nextUri it had reached was DELETEd, which is how Trino is told to stop.
+      assert [%{method: "DELETE", path: path} | _earlier] =
+               mock |> MockTrino.requests() |> Enum.reverse()
+
+      assert path =~ "/v1/statement/endless/"
+
+      # The cancel is a complete request/response, so the connection lives on.
+      assert HTTP.open?(conn)
+    end
+
+    test "submits nothing at all when the deadline has already passed",
+         %{mock: mock, conn: conn} do
+      assert {:error, _conn, %Error{}} =
+               Statement.run(conn, MockTrino.sql(:single), @headers, deadline: in_ms(0))
+
+      assert MockTrino.requests(mock) == []
+    end
+
+    test "caps :receive_timeout at the time the deadline has left", %{conn: conn} do
+      # :slow answers after 100ms, and a receive timeout of a whole second would happily
+      # wait for it — but the deadline says there are only 10ms to spend.
+      started = System.monotonic_time(:millisecond)
+
+      assert {:error, _conn, %Error{message: message}} =
+               Statement.run(conn, MockTrino.sql(:slow), @headers,
+                 receive_timeout: 1_000,
+                 deadline: in_ms(10)
+               )
+
+      # It gave up on its own deadline rather than on the receive timeout it was given,
+      # and says so as a deadline rather than as whatever the socket reported.
+      assert System.monotonic_time(:millisecond) - started < 100
+      assert message =~ ":timeout"
+    end
+
+    test "does not wait out a poll interval that runs past the deadline", %{conn: conn} do
+      started = System.monotonic_time(:millisecond)
+
+      assert {:error, _conn, %Error{}} =
+               Statement.run(conn, MockTrino.sql(:endless), @headers,
+                 poll_interval_ms: 60_000,
+                 deadline: in_ms(500)
+               )
+
+      # A full interval would have been ten seconds; the deadline cut it to fifty
+      # milliseconds and a bit.
+      assert System.monotonic_time(:millisecond) - started < 1_000
+    end
+  end
+
+  describe "run/4 retrying" do
+    test "asks again when the coordinator says it is busy", %{mock: mock, conn: conn} do
+      assert {:ok, _conn, pages, _headers} =
+               Statement.run(conn, MockTrino.sql(:flaky), @headers, [])
+
+      assert Enum.any?(pages, &(&1["stats"]["state"] == "FINISHED"))
+
+      # Two POSTs: the one that was turned away, and the one that was not.
+      posts = mock |> MockTrino.requests() |> Enum.count(&(&1.method == "POST"))
+      assert posts == 2
+    end
+
+    test "asks again when a poll is the thing refused", %{mock: mock, conn: conn} do
+      assert {:ok, _conn, _pages, _headers} =
+               Statement.run(conn, MockTrino.sql(:flaky_poll), @headers, [])
+
+      polls = mock |> MockTrino.requests() |> Enum.count(&(&1.method == "GET"))
+      assert polls == 2
+    end
+
+    test "gives up after :max_attempts and reports the status", %{mock: mock, conn: conn} do
+      assert {:error, _conn, %RuntimeError{message: message}} =
+               Statement.run(conn, MockTrino.sql(:unavailable), @headers, max_attempts: 3)
+
+      assert message =~ "HTTP 503"
+      assert message =~ "POST /v1/statement"
+
+      posts = mock |> MockTrino.requests() |> Enum.count(&(&1.method == "POST"))
+      assert posts == 3
+    end
+
+    test "does not retry at all when :max_attempts is one", %{mock: mock, conn: conn} do
+      assert {:error, _conn, %RuntimeError{}} =
+               Statement.run(conn, MockTrino.sql(:unavailable), @headers, max_attempts: 1)
+
+      assert length(MockTrino.requests(mock)) == 1
+    end
+
+    test "does not retry a status a retry cannot help with", %{mock: mock, conn: conn} do
+      assert {:error, _conn, %RuntimeError{message: message}} =
+               Statement.run(conn, MockTrino.sql(:bad_request), @headers, [])
+
+      assert message =~ "HTTP 400"
+
+      # No amount of asking again turns a 400 into a 200, so it was only asked once.
+      assert length(MockTrino.requests(mock)) == 1
+    end
+
+    test "stops retrying when the deadline runs out", %{mock: mock, conn: conn} do
+      # Far more attempts than the deadline can pay for, so the deadline is what ends it.
+      assert {:error, _conn, reason} =
+               Statement.run(conn, MockTrino.sql(:unavailable), @headers,
+                 max_attempts: 100,
+                 deadline: in_ms(120)
+               )
+
+      # Whether the deadline ended a wait between tries or cut short the request it was in
+      # the middle of, it reports as the deadline. What matters is that it stopped: a
+      # hundred attempts would have taken the better part of a minute.
+      assert %Error{} = reason
+      assert length(MockTrino.requests(mock)) < 10
+    end
+  end
+
   describe "run/4 failures" do
     test "returns the transport error when the POST cannot be sent", %{conn: conn} do
       {:ok, conn} = HTTP.close(conn)
@@ -179,4 +310,6 @@ defmodule Trinox.StatementTest do
              })
     end
   end
+
+  defp in_ms(milliseconds), do: System.monotonic_time(:millisecond) + milliseconds
 end

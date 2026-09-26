@@ -13,6 +13,10 @@ defmodule Trinox.ResultDecoder do
   value, which is what keeps a wide result from re-parsing its own type signatures a
   million times.
 
+  A statement that changes something rather than returning rows says so in `updateType`
+  and `updateCount` instead of in `columns` and `data`; both are carried through to
+  `Trinox.Result`.
+
   Everything here is a pure function over decoded JSON. Fetching the pages is
   `Trinox.Statement`'s job.
 
@@ -90,6 +94,8 @@ defmodule Trinox.ResultDecoder do
       rows: rows,
       num_rows: length(rows),
       query_id: Enum.find_value(pages, & &1["id"]),
+      update_type: Enum.find_value(pages, & &1["updateType"]),
+      update_count: Enum.find_value(pages, & &1["updateCount"]),
       stats: stats(pages)
     }
   end

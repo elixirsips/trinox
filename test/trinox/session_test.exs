@@ -72,6 +72,56 @@ defmodule Trinox.SessionTest do
     end
   end
 
+  describe "build_headers/2 client identity" do
+    test "names the client so a query is not anonymous in Trino" do
+      headers =
+        Session.build_headers(%Session{},
+          user: "alice",
+          source: "billing-etl",
+          client_info: "run=2026-09-26"
+        )
+
+      assert {"x-trino-source", "billing-etl"} in headers
+      assert {"x-trino-client-info", "run=2026-09-26"} in headers
+    end
+
+    test "pins the time zone so a timestamp means the same everywhere" do
+      headers = Session.build_headers(%Session{}, user: "alice", time_zone: "Europe/Berlin")
+
+      assert {"x-trino-time-zone", "Europe/Berlin"} in headers
+    end
+
+    test "sends none of them when they are not configured" do
+      names = Enum.map(Session.build_headers(%Session{}, user: "alice"), &elem(&1, 0))
+
+      refute "x-trino-source" in names
+      refute "x-trino-client-info" in names
+      refute "x-trino-time-zone" in names
+    end
+  end
+
+  describe "build_headers/2 session state" do
+    test "sends the SQL path" do
+      headers = Session.build_headers(%Session{path: "tpch.sf1"}, user: "alice")
+
+      assert {"x-trino-path", "tpch.sf1"} in headers
+    end
+
+    test "sends prepared statements, encoded like session properties" do
+      session = %Session{prepared_statements: %{"by_id" => "SELECT * FROM t WHERE id = ?"}}
+
+      headers = Session.build_headers(session, user: "alice")
+
+      assert {"x-trino-prepared-statement", "by_id=SELECT+%2A+FROM+t+WHERE+id+%3D+%3F"} in headers
+    end
+
+    test "sends the id of the transaction in progress" do
+      headers = Session.build_headers(%Session{transaction_id: "tx-1"}, user: "alice")
+
+      assert {"x-trino-transaction-id", "tx-1"} in headers
+    end
+  end
+
   describe "apply_response_headers/2" do
     # {the response headers, the session they produce from an empty one}
     @responses [
@@ -181,6 +231,45 @@ defmodule Trinox.SessionTest do
     end
   end
 
+  describe "apply_response_headers/2 beyond catalog and schema" do
+    test "sets the SQL path" do
+      session = apply_headers([{"x-trino-set-path", "tpch.sf1"}])
+
+      assert session.path == "tpch.sf1"
+    end
+
+    test "adds a prepared statement, decoding the SQL it arrived URL-encoded as" do
+      session = apply_headers([{"x-trino-added-prepare", "by_id=SELECT+%3F"}])
+
+      assert session.prepared_statements == %{"by_id" => "SELECT ?"}
+    end
+
+    test "deallocates a prepared statement" do
+      session =
+        Session.apply_response_headers(
+          %Session{prepared_statements: %{"by_id" => "SELECT ?", "other" => "SELECT 1"}},
+          [{"x-trino-deallocated-prepare", "by_id"}]
+        )
+
+      assert session.prepared_statements == %{"other" => "SELECT 1"}
+    end
+
+    test "records the transaction a statement started" do
+      session = apply_headers([{"x-trino-started-transaction-id", "tx-1"}])
+
+      assert session.transaction_id == "tx-1"
+    end
+
+    test "forgets the transaction when the coordinator clears it" do
+      session =
+        Session.apply_response_headers(%Session{transaction_id: "tx-1"}, [
+          {"x-trino-clear-transaction-id", "true"}
+        ])
+
+      assert session.transaction_id == nil
+    end
+  end
+
   describe "round trip" do
     test "what a response set is what the next request sends" do
       response = [
@@ -214,4 +303,6 @@ defmodule Trinox.SessionTest do
                session
     end
   end
+
+  defp apply_headers(headers), do: Session.apply_response_headers(%Session{}, headers)
 end

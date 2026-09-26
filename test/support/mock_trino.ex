@@ -23,11 +23,27 @@ defmodule Trinox.MockTrino do
       the terminal page sets one more, so tests can check that *every* page is applied.
     * `:clear_session` — the terminal page clears a session property.
     * `:unavailable` — the `POST` is answered with `503`, as a busy coordinator does.
+    * `:bad_request` — the `POST` is answered with `400`, which no retry can help with.
     * `:invalid_json` — the `POST` is answered with `200` and a broken JSON body.
     * `:slow` — the `POST` is answered only after `slow_delay/0`, then behaves like
       `:single`.
     * `:closing` — the `POST` is answered with `Connection: close`, so the connection is
       gone by the time the poll is sent and the poll fails outright.
+    * `:endless` — every page carries a `nextUri`, so the query never reaches a terminal
+      page. This is the query that only a deadline can end.
+    * `:flaky` — the `POST` is answered `503` once and succeeds on the next attempt.
+    * `:flaky_poll` — the same, but on a poll rather than on the `POST`.
+    * `:update` — a statement that changed something: `updateType` and `updateCount`
+      instead of `columns` and `data`.
+    * `:session_extras` — the terminal page sets a SQL path and adds a prepared statement.
+    * `:deallocate` — the terminal page deallocates that prepared statement.
+    * `:begin`, `:commit`, `:rollback` — the statements `Trinox.transaction/3` sends, which
+      start a transaction (`X-Trino-Started-Transaction-Id`) and end one
+      (`X-Trino-Clear-Transaction-Id`).
+
+  `DELETE`ing a `nextUri` is how a client cancels a running query, and the mock answers
+  `204` to one like a coordinator does. The `DELETE` is recorded like any other request,
+  so a test can assert that an abandoned query was actually cancelled.
 
   `:multi_page` hands back a `nextUri` carrying a query string, since a `nextUri` is
   opaque and has to be followed exactly as given.
@@ -57,6 +73,7 @@ defmodule Trinox.MockTrino do
         }
 
   @query_id "20260923_120000_00000_mock"
+  @transaction_id "8a6a0e1a-mock-4d1e-9c1f-000000000001"
 
   @scenarios %{
     "single" => "SELECT 1",
@@ -66,9 +83,19 @@ defmodule Trinox.MockTrino do
     "session" => "SET SESSION mock_scenario = 'session'",
     "clear_session" => "RESET SESSION mock_scenario",
     "unavailable" => "SELECT * FROM unavailable",
+    "bad_request" => "SELECT * FROM bad_request",
     "invalid_json" => "SELECT * FROM garbage",
     "slow" => "SELECT * FROM slow",
-    "closing" => "SELECT * FROM closing"
+    "closing" => "SELECT * FROM closing",
+    "endless" => "SELECT * FROM endless",
+    "flaky" => "SELECT * FROM flaky",
+    "flaky_poll" => "SELECT * FROM flaky_poll",
+    "update" => "INSERT INTO mock VALUES (1)",
+    "session_extras" => "SET PATH mock.default",
+    "deallocate" => "DEALLOCATE PREPARE mock_statement",
+    "begin" => "START TRANSACTION",
+    "commit" => "COMMIT",
+    "rollback" => "ROLLBACK"
   }
 
   @doc """
@@ -80,12 +107,16 @@ defmodule Trinox.MockTrino do
       passed through to `Bandit`.
     * `:info_status` — the status `GET /v1/info` answers with (default `200`), for
       simulating a coordinator that is unreachable or still starting.
+    * `:port` — the port to listen on (default `0`, an ephemeral one). Pin it to bring a
+      coordinator back up where one was before.
+    * `:fail` — scenarios whose `POST` is answered `503` rather than normally, for the
+      statements a test cannot choose the text of (`:begin`, `:commit`, `:rollback`).
   """
   @spec start!(keyword()) :: t()
   def start!(opts \\ []) do
     {:ok, recorder} = Agent.start_link(fn -> [] end)
 
-    plug_opts = Keyword.merge([recorder: recorder], Keyword.take(opts, [:info_status]))
+    plug_opts = Keyword.merge([recorder: recorder], Keyword.take(opts, [:info_status, :fail]))
 
     bandit_opts =
       Keyword.merge(
@@ -93,9 +124,14 @@ defmodule Trinox.MockTrino do
           plug: {__MODULE__.Router, plug_opts},
           scheme: :http,
           port: 0,
-          startup_log: false
+          startup_log: false,
+          # One acceptor, not ThousandIsland's default hundred. A mock serves one client's
+          # requests one after another, so the other ninety-nine do nothing but spawn and
+          # then, when the mock goes down with its test, race the server they report to and
+          # log a crash each. A hundred of those per mock buries a CI log.
+          thousand_island_options: [num_acceptors: 1]
         ],
-        Keyword.take(opts, [:scheme, :certfile, :keyfile])
+        Keyword.take(opts, [:scheme, :certfile, :keyfile, :port])
       )
 
     {:ok, server} = Bandit.start_link(bandit_opts)
@@ -167,6 +203,10 @@ defmodule Trinox.MockTrino do
   @spec query_id() :: String.t()
   def query_id, do: @query_id
 
+  @doc "The transaction id the mock starts every transaction with."
+  @spec transaction_id() :: String.t()
+  def transaction_id, do: @transaction_id
+
   @doc false
   @spec scenario_for(binary()) :: String.t()
   def scenario_for(statement) do
@@ -190,6 +230,12 @@ defmodule Trinox.MockTrino do
       {"x-trino-set-session", "mock_scenario=session"}
     ]
 
+    # A prepared statement travels URL-encoded, exactly like a session property value.
+    @session_extra_headers [
+      {"x-trino-set-path", "mock.default"},
+      {"x-trino-added-prepare", "mock_statement=SELECT+%3F"}
+    ]
+
     plug(:match)
     plug(:dispatch)
 
@@ -198,7 +244,7 @@ defmodule Trinox.MockTrino do
 
       conn
       |> record(body)
-      |> submit(Trinox.MockTrino.scenario_for(body))
+      |> answer(Trinox.MockTrino.scenario_for(body))
     end
 
     get "/v1/statement/:scenario/:query_id/:token" do
@@ -207,6 +253,12 @@ defmodule Trinox.MockTrino do
       conn
       |> record("")
       |> respond(scenario, String.to_integer(token))
+    end
+
+    delete "/v1/statement/*_next_uri" do
+      conn
+      |> record("")
+      |> send_resp(204, "")
     end
 
     get "/v1/info" do
@@ -235,6 +287,12 @@ defmodule Trinox.MockTrino do
       |> send_resp(404, "not found")
     end
 
+    defp seen(conn, matcher) do
+      recorder = Keyword.fetch!(conn.assigns.mock_trino, :recorder)
+
+      Agent.get(recorder, fn requests -> Enum.count(requests, matcher) end)
+    end
+
     defp record(conn, body) do
       request = %{
         method: conn.method,
@@ -243,11 +301,42 @@ defmodule Trinox.MockTrino do
         body: body
       }
 
-      Agent.update(Keyword.fetch!(conn.assigns.mock_trino, :recorder), &[request | &1])
+      recorder = Keyword.fetch!(conn.assigns.mock_trino, :recorder)
+
+      # A cancelled or slow request can still be in flight when the test that started the
+      # mock ends, and the recorder goes down with it. There is nobody left to record for.
+      if Process.alive?(recorder), do: Agent.update(recorder, &[request | &1])
+
       conn
     end
 
+    # A scenario the test asked to fail is answered `503` whatever it would have said.
+    defp answer(conn, scenario) do
+      failing =
+        conn.assigns.mock_trino
+        |> Keyword.get(:fail, [])
+        |> Enum.map(&to_string/1)
+
+      if scenario in failing do
+        send_resp(conn, 503, "Service Unavailable")
+      else
+        submit(conn, scenario)
+      end
+    end
+
     defp submit(conn, "unavailable"), do: send_resp(conn, 503, "Service Unavailable")
+    defp submit(conn, "bad_request"), do: send_resp(conn, 400, "Bad Request")
+
+    defp submit(conn, "flaky") do
+      sql = Trinox.MockTrino.sql(:flaky)
+
+      # The current request is already recorded, so a second sighting is the retry.
+      if seen(conn, &(&1.body == sql)) > 1 do
+        respond(conn, "single", 0)
+      else
+        send_resp(conn, 503, "Service Unavailable")
+      end
+    end
 
     defp submit(conn, "invalid_json") do
       conn
@@ -261,6 +350,18 @@ defmodule Trinox.MockTrino do
     end
 
     defp submit(conn, scenario), do: respond(conn, scenario, 0)
+
+    # Only the polls are flaky; token 0 is the POST, which must queue normally for there to
+    # be a poll at all.
+    defp respond(conn, "flaky_poll", token) when token > 0 do
+      path = conn.request_path
+
+      if seen(conn, &(&1.method == "GET" and &1.path == path)) > 1 do
+        respond(conn, "single", token)
+      else
+        send_resp(conn, 503, "Service Unavailable")
+      end
+    end
 
     defp respond(conn, scenario, token) do
       %{body: body, headers: headers} = page = page(scenario, token)
@@ -283,6 +384,9 @@ defmodule Trinox.MockTrino do
     # A nextUri the client can never follow: Bandit closes the connection after this
     # response, so the poll fails on a dead socket instead of on a stopwatch.
     defp page("closing", 0), do: with_headers(queued(), [{"connection", "close"}])
+    # No token ever terminates: the only way out of this query is a deadline.
+    defp page("endless", _token), do: more(%{"columns" => columns(), "data" => []})
+
     defp page(_scenario, 0), do: queued()
 
     defp page("multi_page", 1), do: more(%{"columns" => columns(), "data" => [[1, "one"]]})
@@ -295,6 +399,34 @@ defmodule Trinox.MockTrino do
       %{"columns" => columns(), "data" => [[1, "one"]]}
       |> done()
       |> with_headers([{"x-trino-set-session", "mock_page_prop=2"}])
+    end
+
+    defp page("update", 1) do
+      done(%{"updateType" => "INSERT", "updateCount" => 42})
+    end
+
+    defp page("session_extras", 1) do
+      %{"columns" => columns(), "data" => [[1, "one"]]}
+      |> done()
+      |> with_headers(@session_extra_headers)
+    end
+
+    defp page("deallocate", 1) do
+      %{"columns" => columns(), "data" => [[1, "one"]]}
+      |> done()
+      |> with_headers([{"x-trino-deallocated-prepare", "mock_statement"}])
+    end
+
+    defp page("begin", 1) do
+      %{}
+      |> done()
+      |> with_headers([{"x-trino-started-transaction-id", Trinox.MockTrino.transaction_id()}])
+    end
+
+    defp page(scenario, 1) when scenario in ~w(commit rollback) do
+      %{}
+      |> done()
+      |> with_headers([{"x-trino-clear-transaction-id", "true"}])
     end
 
     defp page("clear_session", 1) do

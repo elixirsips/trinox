@@ -1,20 +1,18 @@
 defmodule Trinox.Protocol do
   @moduledoc """
-  `DBConnection` implementation for Trino.
+  Trino's protocol state, and the operations that move it forward.
 
-  Trino speaks a stateless HTTP/JSON protocol rather than holding state on a socket,
-  but a connection still owns something worth pooling: the open HTTP connection to the
-  coordinator, and the session properties the coordinator pushes back. This module is
-  where both live, exactly as `Postgrex.Protocol` owns its socket.
+  Trino speaks a stateless HTTP/JSON protocol rather than holding state on a socket, but
+  a connection still owns something worth keeping: the open HTTP connection to the
+  coordinator, and the session properties the coordinator pushes back.
 
-  Connections are opened explicitly, like `Postgrex`:
+  This module is purely functional — every operation takes the state and hands back the
+  state it produced, and nothing here runs in a process of its own. `Trinox.Connection`
+  is what owns the state and serialises access to it; this module is what it calls.
 
-      DBConnection.start_link(Trinox.Protocol,
-        scheme: :http,
-        hostname: "trino.example.com",
-        port: 8080,
-        username: "alice"
-      )
+      {:ok, state} = Trinox.Protocol.connect(scheme: :http, hostname: "localhost",
+                                             port: 8080, username: "alice")
+      {:ok, result, state} = Trinox.Protocol.execute(state, "SELECT 1", [])
 
   ## Options
 
@@ -25,17 +23,23 @@ defmodule Trinox.Protocol do
     * `:hostname` — default `"localhost"`.
     * `:port` — default `default_port/1` for the scheme.
     * `:catalog`, `:schema` — optional session defaults.
+    * `:source` — what to report as `X-Trino-Source` (default `"trinox"`). This is what an
+      operator sees beside a query in the Trino UI and the query log.
+    * `:client_info` — sent as `X-Trino-Client-Info`, for anything else worth recording
+      about the caller.
+    * `:time_zone` — sent as `X-Trino-Time-Zone`, an IANA name like `"Europe/Berlin"`.
+      Nothing is sent unless it is given, and the coordinator then applies its own default
+      — so set it if a `timestamp with time zone` has to mean the same thing everywhere.
     * `:transport_opts`, `:connect_timeout`, `:receive_timeout` — passed to `Trinox.HTTP`.
     * `:poll_interval_ms` — passed to `Trinox.Statement`; `:receive_timeout` and this
       one may also be given per query, where they override the connection's.
 
-  Any other option is ignored here and handled by `DBConnection` itself (`:pool_size`,
-  `:idle_interval`, `:name`, ...).
+  Any other option is ignored.
 
-  Transactions and cursors are not supported; see `handle_begin/2` and `handle_declare/4`.
+  Transactions and cursors are not supported. Trino does support transactions for
+  connectors that implement them, and its `nextUri` paging is the obvious way to
+  implement cursors later, so both are gaps to fill rather than rules of the protocol.
   """
-
-  @behaviour DBConnection
 
   alias Trinox.Error
   alias Trinox.HTTP
@@ -47,7 +51,13 @@ defmodule Trinox.Protocol do
   @info_path "/v1/info"
 
   # The options a caller may set per query as well as per connection.
-  @query_opts [:receive_timeout, :poll_interval_ms]
+  @query_opts [:receive_timeout, :poll_interval_ms, :max_attempts]
+
+  # Who is asking, as opposed to what is being asked. None of this is session state the
+  # coordinator can change, so it is settled once at connect time.
+  @client_opts [:source, :client_info, :time_zone]
+
+  @default_source "trinox"
 
   defstruct [
     :conn,
@@ -57,6 +67,7 @@ defmodule Trinox.Protocol do
     :user,
     :password,
     session: %Session{},
+    client_opts: [],
     request_opts: []
   ]
 
@@ -68,59 +79,68 @@ defmodule Trinox.Protocol do
           user: String.t(),
           password: String.t() | nil,
           session: Session.t(),
+          client_opts: keyword(),
           request_opts: keyword()
         }
-
-  @typedoc """
-  Anything carrying the statement to run.
-
-  `Trinox.Query` fills this in a later issue; nothing here needs more than the SQL.
-  """
-  @type query :: %{:statement => String.t(), optional(any()) => any()}
 
   @doc "The port a Trino coordinator listens on by default, per scheme."
   @spec default_port(Mint.Types.scheme()) :: :inet.port_number()
   def default_port(:http), do: 8080
   def default_port(:https), do: 8443
 
-  @impl true
-  @spec connect(keyword()) :: {:ok, t()} | {:error, Exception.t()}
-  def connect(opts) do
-    case Keyword.fetch(opts, :username) do
-      {:ok, username} -> do_connect(username, opts)
-      :error -> {:error, %ArgumentError{message: "Trinox requires a :username option"}}
+  @doc """
+  Checks the options without opening anything.
+
+  This is the half of `connect/1` that can only ever fail for the same reason twice — a
+  missing `:username`, or a `:scheme` of `"http"` where `:http` was meant, is a mistake in
+  the caller's code rather than a coordinator having a bad day — which is what lets
+  `Trinox.Connection` refuse to start over one while still retrying a connection that
+  merely could not be reached.
+
+  Checking here rather than letting `Mint` or `default_port/1` fall over is the difference
+  between a caller being told what is wrong and a connection process crashing on its first
+  breath.
+  """
+  @spec validate(keyword()) :: :ok | {:error, Exception.t()}
+  def validate(opts) do
+    with :ok <- validate_username(opts),
+         :ok <- validate_scheme(opts),
+         :ok <- validate_hostname(opts) do
+      validate_port(opts)
     end
   end
 
-  @impl true
-  @spec disconnect(Exception.t(), t()) :: :ok
-  def disconnect(_err, %__MODULE__{conn: conn}) do
+  @doc """
+  Opens a connection to a coordinator.
+
+  See the module documentation for the options.
+  """
+  @spec connect(keyword()) :: {:ok, t()} | {:error, Exception.t()}
+  def connect(opts) do
+    case validate(opts) do
+      :ok -> do_connect(Keyword.fetch!(opts, :username), opts)
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @doc "Closes the connection."
+  @spec close(t()) :: :ok
+  def close(%__MODULE__{conn: conn}) do
     {:ok, _conn} = HTTP.close(conn)
     :ok
   end
 
-  @doc """
-  Verifies the connection is still open before handing it to a client.
-
-  Disconnecting on a closed connection is what makes the pool replace it.
-  """
-  @impl true
-  @spec checkout(t()) :: {:ok, t()} | {:disconnect, Exception.t(), t()}
-  def checkout(%__MODULE__{conn: conn} = state) do
-    if HTTP.open?(conn) do
-      {:ok, state}
-    else
-      {:disconnect, %RuntimeError{message: "connection to Trino is closed"}, state}
-    end
-  end
+  @doc "Whether the connection is still usable."
+  @spec open?(t()) :: boolean()
+  def open?(%__MODULE__{conn: conn}), do: HTTP.open?(conn)
 
   @doc """
-  Checks an idle connection with a `GET #{@info_path}`.
+  Checks the connection with a `GET #{@info_path}`.
 
   Trino keeps no server-side session for us, so this exists purely to notice a
-  connection the coordinator (or something in between) has dropped.
+  connection the coordinator (or something in between) has dropped. `:disconnect` means
+  the connection is spent and its owner should be replaced.
   """
-  @impl true
   @spec ping(t()) :: {:ok, t()} | {:disconnect, Exception.t(), t()}
   def ping(%__MODULE__{} = state) do
     headers = request_headers(state)
@@ -133,17 +153,7 @@ defmodule Trinox.Protocol do
   end
 
   @doc """
-  Hands the query back unchanged.
-
-  Trino's REST API has no prepare step to speak of — a statement is submitted as text —
-  so there is no round trip to make here.
-  """
-  @impl true
-  @spec handle_prepare(query(), keyword(), t()) :: {:ok, query(), t()}
-  def handle_prepare(query, _opts, state), do: {:ok, query, state}
-
-  @doc """
-  Submits the query's statement, polls it to completion and decodes the result.
+  Submits `statement`, polls it to completion and decodes the result.
 
   The session travels with the query in both directions: the outbound headers are built
   from the connection's session, and the `X-Trino-Set-*` headers of *every* page are
@@ -152,82 +162,90 @@ defmodule Trinox.Protocol do
 
   A query Trino refused is a `Trinox.Error` — Trino answers `200` with an error page
   rather than failing the request, and the connection stays perfectly usable. A broken
-  conversation is different: it returns the transport or decoding error, and disconnects
-  if the connection did not survive, so the pool replaces it.
+  conversation is different: it returns the transport or decoding error, and says
+  `:disconnect` if the connection did not survive it.
 
-  `params` are ignored. Trino takes a statement as text and this milestone has no
-  prepared statements, so a query carries whatever SQL it was built with.
+  `opts` may carry `:receive_timeout` and `:poll_interval_ms`, which override the
+  connection's for this one query, and `:deadline` — an absolute
+  `System.monotonic_time(:millisecond)` past which the query is cancelled rather than
+  polled on. A cancelled query is an `:error`, not a `:disconnect`: the point of asking
+  Trino to stop is that the connection survives to serve the next caller.
   """
-  @impl true
-  @spec handle_execute(query(), term(), keyword(), t()) ::
-          {:ok, query(), Result.t(), t()} | {:error | :disconnect, Exception.t(), t()}
-  def handle_execute(%{statement: statement} = query, _params, opts, state) do
+  @spec execute(t(), String.t(), keyword()) ::
+          {:ok, Result.t(), t()} | {:error | :disconnect, Exception.t(), t()}
+  def execute(%__MODULE__{} = state, statement, opts) do
     headers = request_headers(state)
 
     case Statement.run(state.conn, statement, headers, query_opts(state, opts)) do
       {:ok, conn, pages, response_headers} ->
-        decode(query, pages, apply_session(state, conn, response_headers))
+        decode(pages, apply_session(state, conn, response_headers))
 
       {:error, conn, reason} ->
         failed(reason, %{state | conn: conn})
     end
   end
 
-  @doc """
-  Nothing to close — `handle_prepare/3` left nothing behind on the coordinator.
-  """
-  @impl true
-  @spec handle_close(query(), keyword(), t()) :: {:ok, nil, t()}
-  def handle_close(_query, _opts, state), do: {:ok, nil, state}
+  defp validate_username(opts) do
+    case Keyword.fetch(opts, :username) do
+      {:ok, username} when is_binary(username) -> :ok
+      {:ok, other} -> invalid(:username, other, "a string")
+      :error -> {:error, %ArgumentError{message: "Trinox requires a :username option"}}
+    end
+  end
 
-  @doc """
-  Transactions are not supported; these report the `:error` transaction status.
+  defp validate_scheme(opts) do
+    case Keyword.fetch(opts, :scheme) do
+      {:ok, scheme} when scheme in [:http, :https] -> :ok
+      {:ok, other} -> invalid(:scheme, other, "the atom :http or :https")
+      :error -> :ok
+    end
+  end
 
-  `DBConnection` turns that into a `DBConnection.TransactionError` for the caller
-  without tearing the connection down, which is the only "no" these three callbacks
-  can express — unlike the others, they cannot return an exception of their own.
+  defp validate_hostname(opts) do
+    case Keyword.fetch(opts, :hostname) do
+      {:ok, hostname} when is_binary(hostname) -> validate_bare_host(hostname)
+      {:ok, other} -> invalid(:hostname, other, "a string")
+      :error -> :ok
+    end
+  end
 
-  Trino does support transactions for connectors that implement them, so this is a gap
-  to fill rather than a rule of the protocol.
-  """
-  @impl true
-  @spec handle_begin(keyword(), t()) :: {:error, t()}
-  def handle_begin(_opts, state), do: {:error, state}
+  # `"trino.example.com:8080"` is a URL authority, not a host, and resolves to nothing —
+  # so it is worth saying so rather than retrying DNS until someone reads the logs. One
+  # colon followed by digits is that mistake; an IPv6 address always has at least two.
+  defp validate_bare_host(hostname) do
+    case String.split(hostname, ":") do
+      [host, port] -> bare_host_error(hostname, host, port)
+      _host_or_ipv6 -> :ok
+    end
+  end
 
-  @impl true
-  @spec handle_commit(keyword(), t()) :: {:error, t()}
-  def handle_commit(_opts, state), do: {:error, state}
+  defp bare_host_error(hostname, host, port) do
+    if host != "" and port != "" and match?({_integer, ""}, Integer.parse(port)) do
+      {:error,
+       %ArgumentError{
+         message:
+           "Trinox :hostname must be a host on its own, got #{inspect(hostname)}; " <>
+             "pass #{inspect(host)} as :hostname and #{port} as :port"
+       }}
+    else
+      :ok
+    end
+  end
 
-  @impl true
-  @spec handle_rollback(keyword(), t()) :: {:error, t()}
-  def handle_rollback(_opts, state), do: {:error, state}
+  defp validate_port(opts) do
+    case Keyword.fetch(opts, :port) do
+      {:ok, port} when is_integer(port) and port > 0 and port < 65_536 -> :ok
+      {:ok, other} -> invalid(:port, other, "a port number")
+      :error -> :ok
+    end
+  end
 
-  @doc """
-  Cursors are not supported; these three refuse with a `Trinox.Error`.
-
-  `DBConnection.stream/4` and friends land here. Trino's `nextUri` paging is the obvious
-  way to implement them later — `Trinox.Statement` already walks exactly those pages —
-  but until then a stream would have to buffer the whole result, which is the opposite
-  of what the caller asked for.
-  """
-  @impl true
-  @spec handle_declare(query(), term(), keyword(), t()) :: {:error, Error.t(), t()}
-  def handle_declare(_query, _params, _opts, state), do: {:error, no_cursors(), state}
-
-  @impl true
-  @spec handle_fetch(query(), term(), keyword(), t()) :: {:error, Error.t(), t()}
-  def handle_fetch(_query, _cursor, _opts, state), do: {:error, no_cursors(), state}
-
-  @impl true
-  @spec handle_deallocate(query(), term(), keyword(), t()) :: {:error, Error.t(), t()}
-  def handle_deallocate(_query, _cursor, _opts, state), do: {:error, no_cursors(), state}
-
-  @doc """
-  Always `:idle` — Trino transactions are out of scope for this milestone.
-  """
-  @impl true
-  @spec handle_status(keyword(), t()) :: {:idle, t()}
-  def handle_status(_opts, state), do: {:idle, state}
+  defp invalid(key, value, expected) do
+    {:error,
+     %ArgumentError{
+       message: "Trinox #{inspect(key)} must be #{expected}, got #{inspect(value)}"
+     }}
+  end
 
   defp do_connect(username, opts) do
     scheme = Keyword.get(opts, :scheme, :https)
@@ -253,27 +271,39 @@ defmodule Trinox.Protocol do
         catalog: Keyword.get(opts, :catalog),
         schema: Keyword.get(opts, :schema)
       },
+      client_opts: client_opts(opts),
       request_opts: Keyword.take(opts, @query_opts)
     }
   end
 
+  defp client_opts(opts) do
+    opts
+    |> Keyword.take(@client_opts)
+    |> Keyword.put_new(:source, @default_source)
+  end
+
   defp request_headers(%__MODULE__{} = state) do
-    Session.build_headers(state.session, user: state.user, password: state.password)
+    opts = [user: state.user, password: state.password] ++ state.client_opts
+
+    Session.build_headers(state.session, opts)
   end
 
   # A per-query option wins over the connection's: the connection sets the house style,
-  # one slow query overrides it.
+  # one slow query overrides it. A deadline is never a connection-wide setting — it is
+  # one caller's patience — so it is taken from the query's options alone.
   defp query_opts(%__MODULE__{} = state, opts) do
-    Keyword.merge(state.request_opts, Keyword.take(opts, @query_opts))
+    state.request_opts
+    |> Keyword.merge(Keyword.take(opts, @query_opts))
+    |> Keyword.put(:deadline, Keyword.get(opts, :deadline, :infinity))
   end
 
   defp apply_session(%__MODULE__{} = state, conn, headers) do
     %{state | conn: conn, session: Session.apply_response_headers(state.session, headers)}
   end
 
-  defp decode(query, pages, state) do
+  defp decode(pages, state) do
     case ResultDecoder.decode(pages) do
-      {:ok, result} -> {:ok, query, result, state}
+      {:ok, result} -> {:ok, result, state}
       {:error, error} -> {:error, Error.from_page(error, query_id(pages)), state}
     end
   end
@@ -283,18 +313,14 @@ defmodule Trinox.Protocol do
   defp query_id(pages), do: Enum.find_value(pages, & &1["id"])
 
   # A statement that broke the conversation rather than failing on its merits. If the
-  # connection did not survive it, only a disconnect gets the pool to replace it; a bad
-  # status or an unreadable body leaves the connection perfectly fine to reuse.
+  # connection did not survive it, only a disconnect is honest about it; a bad status or
+  # an unreadable body leaves the connection perfectly fine to reuse.
   defp failed(reason, %__MODULE__{} = state) do
-    if HTTP.open?(state.conn) do
+    if open?(state) do
       {:error, reason, state}
     else
       {:disconnect, reason, state}
     end
-  end
-
-  defp no_cursors do
-    %Error{message: "Trinox does not support cursors; use a query instead"}
   end
 
   defp ping_error(%{status: status}) do

@@ -26,7 +26,10 @@ defmodule Trinox.ProtocolTest do
       assert HTTP.open?(state.conn)
     end
 
-    test "keeps the password and the session defaults", %{opts: opts} do
+    test "keeps the password and the session defaults" do
+      # A password may only be sent over TLS, so it is only settable against a TLS mock.
+      {_mock, opts} = tls_mock()
+
       assert {:ok, state} =
                Protocol.connect(opts ++ [password: "secret", catalog: "tpch", schema: "sf1"])
 
@@ -118,6 +121,20 @@ defmodule Trinox.ProtocolTest do
       assert :ok = Protocol.validate(username: "alice", hostname: "::1")
       assert :ok = Protocol.validate(username: "alice", hostname: "2001:db8::1")
       assert :ok = Protocol.validate(username: "alice", hostname: "trino:not-a-port")
+    end
+
+    test "refuses to put a password on the wire in cleartext" do
+      assert {:error, %ArgumentError{message: message}} =
+               Protocol.validate(username: "alice", password: "s3cret", scheme: :http)
+
+      assert message =~ "will not send a :password over :http"
+
+      # Over TLS it is exactly what Basic auth is for, and :https is the default.
+      assert :ok = Protocol.validate(username: "alice", password: "s3cret", scheme: :https)
+      assert :ok = Protocol.validate(username: "alice", password: "s3cret")
+
+      # And plain :http is fine as long as there is no password to leak.
+      assert :ok = Protocol.validate(username: "alice", scheme: :http)
     end
 
     test "refuses a hostname or port of the wrong shape" do
@@ -218,7 +235,8 @@ defmodule Trinox.ProtocolTest do
       assert MockTrino.header(first, "authorization") == nil
     end
 
-    test "sends the Basic-auth header when a password is configured", %{mock: mock, opts: opts} do
+    test "sends the Basic-auth header when a password is configured" do
+      {mock, opts} = tls_mock()
       {:ok, state} = Protocol.connect(opts ++ [password: "secret"])
 
       assert {:ok, _state} = Protocol.ping(state)
@@ -293,7 +311,9 @@ defmodule Trinox.ProtocolTest do
       assert body == MockTrino.sql(:single)
     end
 
-    test "sends the session as headers on every request", %{mock: mock, opts: opts} do
+    test "sends the session as headers on every request" do
+      {mock, opts} = tls_mock()
+
       {:ok, state} =
         Protocol.connect(opts ++ [password: "secret", catalog: "tpch", schema: "sf1"])
 
@@ -395,5 +415,18 @@ defmodule Trinox.ProtocolTest do
 
   defp opts(mock) do
     [scheme: :http, hostname: "127.0.0.1", port: mock.port, username: "alice"]
+  end
+
+  # A coordinator serving TLS, for the options that may only be sent over it.
+  defp tls_mock do
+    mock = MockTrino.start!(MockTrino.tls_opts())
+
+    {mock,
+     [
+       hostname: "localhost",
+       port: mock.port,
+       username: "alice",
+       transport_opts: [cacertfile: MockTrino.ca_path()]
+     ]}
   end
 end

@@ -90,7 +90,10 @@ defmodule TrinoxTest do
       stop(conn)
     end
 
-    test "sends the connection's identity and session defaults", %{mock: mock, opts: opts} do
+    test "sends the connection's identity and session defaults" do
+      # Basic auth is refused over :http, so this runs against the TLS mock — which is the
+      # transport it would be used on anyway.
+      {mock, opts} = tls_mock()
       conn = connect(opts, password: "secret", catalog: "tpch", schema: "sf1")
 
       assert {:ok, %Result{}} = Trinox.query(conn, MockTrino.sql(:single))
@@ -141,11 +144,50 @@ defmodule TrinoxTest do
       # The connection would have waited five seconds; this query gives up after one
       # millisecond, which it can only do if the option reached the protocol.
       assert {:error, %Mint.TransportError{reason: :timeout}} =
-               Trinox.query(conn, MockTrino.sql(:slow), receive_timeout: 1)
+               Trinox.query(conn, MockTrino.sql(:slow), [], receive_timeout: 1)
 
       # A half-read response leaves nothing to reuse the socket for, so the connection
       # stops itself once the caller has the error; there is nothing left to stop here.
       refute Process.alive?(conn)
+    end
+  end
+
+  describe "query/4 parameters" do
+    test "takes options in fourth place, leaving third for parameters", %{mock: mock, opts: opts} do
+      conn = connect(opts)
+
+      assert {:ok, %Result{}} =
+               Trinox.query(conn, MockTrino.sql(:single), [], receive_timeout: 5_000)
+
+      assert MockTrino.requests(mock) != []
+
+      stop(conn)
+    end
+
+    test "refuses parameters, since there is nothing behind them yet", %{opts: opts} do
+      conn = connect(opts)
+
+      assert_raise ArgumentError, ~r/does not support query parameters yet/, fn ->
+        Trinox.query(conn, "SELECT ?", [1])
+      end
+
+      stop(conn)
+    end
+
+    test "spots options passed one argument early", %{opts: opts} do
+      conn = connect(opts)
+
+      # The mistake this argument order invites, so it is worth naming rather than
+      # reporting as an unsupported parameter list.
+      assert_raise ArgumentError, ~r/looks like options/, fn ->
+        Trinox.query(conn, MockTrino.sql(:single), timeout: 500)
+      end
+
+      assert_raise ArgumentError, ~r/looks like options/, fn ->
+        Trinox.query!(conn, MockTrino.sql(:single), timeout: 500)
+      end
+
+      stop(conn)
     end
   end
 
@@ -156,7 +198,10 @@ defmodule TrinoxTest do
       assert {:ok, %Result{}} = Trinox.query(conn, MockTrino.sql(:single))
 
       assert {:error, %Error{message: message}} =
-               Trinox.query(conn, MockTrino.sql(:endless), poll_interval_ms: 60_000, timeout: 500)
+               Trinox.query(conn, MockTrino.sql(:endless), [],
+                 poll_interval_ms: 60_000,
+                 timeout: 500
+               )
 
       assert message =~ ":timeout"
       assert Enum.any?(MockTrino.requests(mock), &(&1.method == "DELETE"))
@@ -182,7 +227,7 @@ defmodule TrinoxTest do
       assert {:ok, %Result{}} = Trinox.query(conn, MockTrino.sql(:single))
 
       assert_raise Error, ~r/:timeout/, fn ->
-        Trinox.query!(conn, MockTrino.sql(:endless), poll_interval_ms: 60_000, timeout: 500)
+        Trinox.query!(conn, MockTrino.sql(:endless), [], poll_interval_ms: 60_000, timeout: 500)
       end
 
       stop(conn)
@@ -392,6 +437,19 @@ defmodule TrinoxTest do
 
   defp opts(mock) do
     [scheme: :http, hostname: "127.0.0.1", port: mock.port, username: "alice"]
+  end
+
+  # A coordinator serving TLS, for the options that may only be sent over it.
+  defp tls_mock do
+    mock = MockTrino.start!(MockTrino.tls_opts())
+
+    {mock,
+     [
+       hostname: "localhost",
+       port: mock.port,
+       username: "alice",
+       transport_opts: [cacertfile: MockTrino.ca_path()]
+     ]}
   end
 
   # A connection with an owner refuses a query from anyone else, which is how another

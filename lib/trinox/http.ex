@@ -5,7 +5,7 @@ defmodule Trinox.HTTP do
   This module is Trino-agnostic: it knows nothing about statements, JSON or session
   headers. It opens a connection, sends one request on it and blocks until the whole
   response has arrived, which is what `Trinox.Protocol` needs — it runs inside the
-  connection process, and `Trinox.query/3` is a blocking call.
+  connection process, and `Trinox.query/4` is a blocking call.
 
   Connections are opened in `:passive` mode so that response data never lands in the
   owner's mailbox and `request/6` can drive `Mint.HTTP.recv/3` itself.

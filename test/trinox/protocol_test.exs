@@ -77,6 +77,126 @@ defmodule Trinox.ProtocolTest do
     end
   end
 
+  describe "validate/1" do
+    test "accepts the options a connection needs" do
+      assert :ok = Protocol.validate(username: "alice")
+
+      assert :ok =
+               Protocol.validate(
+                 username: "alice",
+                 scheme: :https,
+                 hostname: "trino.example.com",
+                 port: 8443
+               )
+    end
+
+    test "requires a username" do
+      assert {:error, %ArgumentError{message: message}} = Protocol.validate([])
+      assert message =~ ":username"
+
+      assert {:error, %ArgumentError{message: message}} = Protocol.validate(username: 123)
+      assert message =~ "must be a string"
+    end
+
+    test "refuses a scheme that is a string rather than an atom" do
+      assert {:error, %ArgumentError{message: message}} =
+               Protocol.validate(username: "alice", scheme: "http")
+
+      assert message =~ ~s(:scheme must be the atom :http or :https, got "http")
+    end
+
+    test "refuses a hostname carrying the port, and says where the port goes" do
+      assert {:error, %ArgumentError{message: message}} =
+               Protocol.validate(username: "alice", hostname: "trino.example.com:8080")
+
+      assert message =~ ~s(pass "trino.example.com" as :hostname and 8080 as :port)
+    end
+
+    test "leaves a hostname alone when the colon is not a port" do
+      # An IPv6 address always has more than one colon, and a garbled host is Mint's to
+      # complain about rather than something to guess at here.
+      assert :ok = Protocol.validate(username: "alice", hostname: "::1")
+      assert :ok = Protocol.validate(username: "alice", hostname: "2001:db8::1")
+      assert :ok = Protocol.validate(username: "alice", hostname: "trino:not-a-port")
+    end
+
+    test "refuses a hostname or port of the wrong shape" do
+      assert {:error, %ArgumentError{message: message}} =
+               Protocol.validate(username: "alice", hostname: :localhost)
+
+      assert message =~ ":hostname must be a string"
+
+      assert {:error, %ArgumentError{message: message}} =
+               Protocol.validate(username: "alice", port: "8080")
+
+      assert message =~ ":port must be a port number"
+
+      assert {:error, %ArgumentError{}} = Protocol.validate(username: "alice", port: 70_000)
+    end
+  end
+
+  describe "connect/1 client identity" do
+    test "names itself as the source unless told otherwise", %{mock: mock, opts: opts} do
+      {:ok, state} = Protocol.connect(opts)
+      {:ok, _result, _state} = Protocol.execute(state, MockTrino.sql(:single), [])
+
+      assert MockTrino.header(MockTrino.last_request(mock), "x-trino-source") == "trinox"
+    end
+
+    test "sends the source, client info and time zone it was given",
+         %{mock: mock, opts: opts} do
+      {:ok, state} =
+        Protocol.connect(
+          opts ++ [source: "billing-etl", client_info: "run=7", time_zone: "Europe/Berlin"]
+        )
+
+      {:ok, _result, _state} = Protocol.execute(state, MockTrino.sql(:single), [])
+
+      request = MockTrino.last_request(mock)
+
+      assert MockTrino.header(request, "x-trino-source") == "billing-etl"
+      assert MockTrino.header(request, "x-trino-client-info") == "run=7"
+      assert MockTrino.header(request, "x-trino-time-zone") == "Europe/Berlin"
+    end
+  end
+
+  describe "execute/3 for a statement that changed something" do
+    test "reports the update type and count", %{opts: opts} do
+      {:ok, state} = Protocol.connect(opts)
+
+      assert {:ok, %Result{} = result, _state} =
+               Protocol.execute(state, MockTrino.sql(:update), [])
+
+      assert result.update_type == "INSERT"
+      assert result.update_count == 42
+      assert result.num_rows == 0
+    end
+  end
+
+  describe "execute/3 session extras" do
+    test "folds a SQL path and a prepared statement back in, and echoes them",
+         %{mock: mock, opts: opts} do
+      {:ok, state} = Protocol.connect(opts)
+
+      {:ok, _result, state} = Protocol.execute(state, MockTrino.sql(:session_extras), [])
+
+      assert state.session.path == "mock.default"
+      assert state.session.prepared_statements == %{"mock_statement" => "SELECT ?"}
+
+      {:ok, _result, state} = Protocol.execute(state, MockTrino.sql(:single), [])
+
+      request = MockTrino.last_request(mock)
+      assert MockTrino.header(request, "x-trino-path") == "mock.default"
+
+      assert MockTrino.header(request, "x-trino-prepared-statement") ==
+               "mock_statement=SELECT+%3F"
+
+      # And a DEALLOCATE takes it away again.
+      {:ok, _result, state} = Protocol.execute(state, MockTrino.sql(:deallocate), [])
+      assert state.session.prepared_statements == %{}
+    end
+  end
+
   describe "default_port/1" do
     test "matches Trino's defaults" do
       assert Protocol.default_port(:http) == 8080

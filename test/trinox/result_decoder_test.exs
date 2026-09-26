@@ -99,6 +99,51 @@ defmodule Trinox.ResultDecoderTest do
     end
   end
 
+  describe "decode/1 for a statement that changed something" do
+    test "carries updateType and updateCount rather than reporting nothing" do
+      page = %{
+        "id" => "q1",
+        "stats" => %{"state" => "FINISHED"},
+        "updateType" => "INSERT",
+        "updateCount" => 42
+      }
+
+      assert {:ok, result} = ResultDecoder.decode([page])
+
+      assert result.update_type == "INSERT"
+      assert result.update_count == 42
+
+      # num_rows stays what it says it is: how many rows came back.
+      assert result.rows == []
+      assert result.num_rows == 0
+    end
+
+    test "leaves both alone for a statement that returned rows" do
+      page = %{
+        "id" => "q1",
+        "stats" => %{"state" => "FINISHED"},
+        "columns" => [%{"name" => "n", "type" => "bigint"}],
+        "data" => [[1]]
+      }
+
+      assert {:ok, result} = ResultDecoder.decode([page])
+
+      assert result.update_type == nil
+      assert result.update_count == nil
+      assert result.num_rows == 1
+    end
+
+    test "finds an updateType a later page carried" do
+      pages = [
+        %{"id" => "q1", "stats" => %{"state" => "RUNNING"}},
+        %{"updateType" => "CREATE TABLE", "stats" => %{"state" => "FINISHED"}}
+      ]
+
+      assert {:ok, result} = ResultDecoder.decode(pages)
+      assert result.update_type == "CREATE TABLE"
+    end
+  end
+
   describe "decode/1 with a failed query" do
     test "returns Trino's error object" do
       error = %{"errorName" => "TABLE_NOT_FOUND", "message" => "does not exist"}

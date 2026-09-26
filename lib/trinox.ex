@@ -32,6 +32,9 @@ defmodule Trinox do
   start, so Trino being slow to come up does not stop your application coming up; see
   `Trinox.Connection` for what that means for the queries in between.
 
+  `transaction/3` runs several statements in one Trino transaction, for the connectors
+  that support them.
+
   ## Options
 
   `start_link/1` takes `Trinox.Protocol`'s options — `:username` (required), `:password`,
@@ -111,6 +114,58 @@ defmodule Trinox do
   end
 
   @doc """
+  Runs `fun` inside a Trino transaction on `conn`.
+
+  `START TRANSACTION` is sent first, `fun` is called with `conn`, and then `COMMIT` — or
+  `ROLLBACK`, if `fun` raises, throws, exits or calls `rollback/2`. Returns `{:ok, value}`
+  with whatever `fun` returned, or `{:error, reason}` if the transaction could not be
+  started or committed. Anything `fun` raised is re-raised once the rollback has been sent.
+
+      Trinox.transaction(conn, fn conn ->
+        Trinox.query!(conn, "INSERT INTO t VALUES (1)")
+        Trinox.query!(conn, "INSERT INTO t VALUES (2)")
+      end)
+
+  Only connectors that implement transactions support this; against one that does not,
+  Trino refuses the `START TRANSACTION` and the refusal comes back as `{:error, _}`.
+
+  ## The connection is yours for the duration
+
+  A Trino transaction lives in the session, and the session belongs to one connection, so
+  for as long as `fun` runs that connection is reserved for the calling process. A query
+  sent from any other process is refused rather than silently joined to the transaction —
+  which means `fun` must do its own work rather than handing `conn` to a `Task`. Transactions
+  do not nest: a `transaction/3` inside a `transaction/3` returns an error.
+
+  If the calling process dies inside `fun`, the transaction is rolled back and the
+  connection stops, since what it was in the middle of is nobody's to finish. And if the
+  connection itself dies, this call exits like any other call to a dead process.
+  """
+  @spec transaction(conn(), (conn() -> result), keyword()) ::
+          {:ok, result} | {:error, Exception.t()}
+        when result: var
+  def transaction(conn, fun, opts \\ []) do
+    case Connection.begin(conn, opts) do
+      :ok -> run_transaction(conn, fun, opts)
+      {:error, error} -> {:error, error}
+    end
+  end
+
+  @doc """
+  Rolls the surrounding `transaction/3` back, which returns `{:error, reason}`.
+
+  This throws, so nothing after it in `fun` runs.
+
+      Trinox.transaction(conn, fn conn ->
+        Trinox.query!(conn, "DELETE FROM t")
+        Trinox.rollback(conn, :changed_my_mind)
+      end)
+      #=> {:error, :changed_my_mind}
+  """
+  @spec rollback(conn(), term()) :: no_return()
+  def rollback(_conn, reason), do: throw({__MODULE__, :rollback, reason})
+
+  @doc """
   Asks the coordinator whether `conn` is still usable.
 
   Nothing calls this for you — there is no pool watching the connection while it sits
@@ -118,4 +173,26 @@ defmodule Trinox do
   """
   @spec ping(conn(), keyword()) :: :ok | {:error, Exception.t()}
   def ping(conn, opts \\ []), do: Connection.ping(conn, opts)
+
+  defp run_transaction(conn, fun, opts) do
+    fun.(conn)
+  catch
+    :throw, {__MODULE__, :rollback, reason} ->
+      _ = Connection.rollback(conn, opts)
+      {:error, reason}
+
+    kind, reason ->
+      stacktrace = __STACKTRACE__
+      _ = Connection.rollback(conn, opts)
+      :erlang.raise(kind, reason, stacktrace)
+  else
+    value -> commit(conn, value, opts)
+  end
+
+  defp commit(conn, value, opts) do
+    case Connection.commit(conn, opts) do
+      :ok -> {:ok, value}
+      {:error, error} -> {:error, error}
+    end
+  end
 end

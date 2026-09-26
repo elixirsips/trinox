@@ -187,6 +187,70 @@ defmodule Trinox.StatementTest do
     end
   end
 
+  describe "run/4 retrying" do
+    test "asks again when the coordinator says it is busy", %{mock: mock, conn: conn} do
+      assert {:ok, _conn, pages, _headers} =
+               Statement.run(conn, MockTrino.sql(:flaky), @headers, [])
+
+      assert Enum.any?(pages, &(&1["stats"]["state"] == "FINISHED"))
+
+      # Two POSTs: the one that was turned away, and the one that was not.
+      posts = mock |> MockTrino.requests() |> Enum.count(&(&1.method == "POST"))
+      assert posts == 2
+    end
+
+    test "asks again when a poll is the thing refused", %{mock: mock, conn: conn} do
+      assert {:ok, _conn, _pages, _headers} =
+               Statement.run(conn, MockTrino.sql(:flaky_poll), @headers, [])
+
+      polls = mock |> MockTrino.requests() |> Enum.count(&(&1.method == "GET"))
+      assert polls == 2
+    end
+
+    test "gives up after :max_attempts and reports the status", %{mock: mock, conn: conn} do
+      assert {:error, _conn, %RuntimeError{message: message}} =
+               Statement.run(conn, MockTrino.sql(:unavailable), @headers, max_attempts: 3)
+
+      assert message =~ "HTTP 503"
+      assert message =~ "POST /v1/statement"
+
+      posts = mock |> MockTrino.requests() |> Enum.count(&(&1.method == "POST"))
+      assert posts == 3
+    end
+
+    test "does not retry at all when :max_attempts is one", %{mock: mock, conn: conn} do
+      assert {:error, _conn, %RuntimeError{}} =
+               Statement.run(conn, MockTrino.sql(:unavailable), @headers, max_attempts: 1)
+
+      assert length(MockTrino.requests(mock)) == 1
+    end
+
+    test "does not retry a status a retry cannot help with", %{mock: mock, conn: conn} do
+      assert {:error, _conn, %RuntimeError{message: message}} =
+               Statement.run(conn, MockTrino.sql(:bad_request), @headers, [])
+
+      assert message =~ "HTTP 400"
+
+      # No amount of asking again turns a 400 into a 200, so it was only asked once.
+      assert length(MockTrino.requests(mock)) == 1
+    end
+
+    test "stops retrying when the deadline runs out", %{mock: mock, conn: conn} do
+      # Far more attempts than the deadline can pay for, so the deadline is what ends it.
+      assert {:error, _conn, reason} =
+               Statement.run(conn, MockTrino.sql(:unavailable), @headers,
+                 max_attempts: 100,
+                 deadline: in_ms(120)
+               )
+
+      # The deadline either ended a wait between tries, giving the cancellation error, or
+      # cut short the request it was in the middle of. Either way what matters is that it
+      # stopped: a hundred attempts would have taken the better part of a minute.
+      assert is_exception(reason)
+      assert length(MockTrino.requests(mock)) < 10
+    end
+  end
+
   describe "run/4 failures" do
     test "returns the transport error when the POST cannot be sent", %{conn: conn} do
       {:ok, conn} = HTTP.close(conn)

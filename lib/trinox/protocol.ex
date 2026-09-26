@@ -23,6 +23,13 @@ defmodule Trinox.Protocol do
     * `:hostname` — default `"localhost"`.
     * `:port` — default `default_port/1` for the scheme.
     * `:catalog`, `:schema` — optional session defaults.
+    * `:source` — what to report as `X-Trino-Source` (default `"trinox"`). This is what an
+      operator sees beside a query in the Trino UI and the query log.
+    * `:client_info` — sent as `X-Trino-Client-Info`, for anything else worth recording
+      about the caller.
+    * `:time_zone` — sent as `X-Trino-Time-Zone`, an IANA name like `"Europe/Berlin"`.
+      Nothing is sent unless it is given, and the coordinator then applies its own default
+      — so set it if a `timestamp with time zone` has to mean the same thing everywhere.
     * `:transport_opts`, `:connect_timeout`, `:receive_timeout` — passed to `Trinox.HTTP`.
     * `:poll_interval_ms` — passed to `Trinox.Statement`; `:receive_timeout` and this
       one may also be given per query, where they override the connection's.
@@ -44,7 +51,13 @@ defmodule Trinox.Protocol do
   @info_path "/v1/info"
 
   # The options a caller may set per query as well as per connection.
-  @query_opts [:receive_timeout, :poll_interval_ms]
+  @query_opts [:receive_timeout, :poll_interval_ms, :max_attempts]
+
+  # Who is asking, as opposed to what is being asked. None of this is session state the
+  # coordinator can change, so it is settled once at connect time.
+  @client_opts [:source, :client_info, :time_zone]
+
+  @default_source "trinox"
 
   defstruct [
     :conn,
@@ -54,6 +67,7 @@ defmodule Trinox.Protocol do
     :user,
     :password,
     session: %Session{},
+    client_opts: [],
     request_opts: []
   ]
 
@@ -65,6 +79,7 @@ defmodule Trinox.Protocol do
           user: String.t(),
           password: String.t() | nil,
           session: Session.t(),
+          client_opts: keyword(),
           request_opts: keyword()
         }
 
@@ -77,16 +92,21 @@ defmodule Trinox.Protocol do
   Checks the options without opening anything.
 
   This is the half of `connect/1` that can only ever fail for the same reason twice — a
-  missing `:username` is a mistake in the caller's code, not a coordinator having a bad
-  day — which is what lets `Trinox.Connection` refuse to start over it while still
-  retrying a connection that merely could not be reached.
+  missing `:username`, or a `:scheme` of `"http"` where `:http` was meant, is a mistake in
+  the caller's code rather than a coordinator having a bad day — which is what lets
+  `Trinox.Connection` refuse to start over one while still retrying a connection that
+  merely could not be reached.
+
+  Checking here rather than letting `Mint` or `default_port/1` fall over is the difference
+  between a caller being told what is wrong and a connection process crashing on its first
+  breath.
   """
-  @spec validate(keyword()) :: :ok | {:error, %ArgumentError{}}
+  @spec validate(keyword()) :: :ok | {:error, Exception.t()}
   def validate(opts) do
-    if Keyword.has_key?(opts, :username) do
-      :ok
-    else
-      {:error, %ArgumentError{message: "Trinox requires a :username option"}}
+    with :ok <- validate_username(opts),
+         :ok <- validate_scheme(opts),
+         :ok <- validate_hostname(opts) do
+      validate_port(opts)
     end
   end
 
@@ -165,6 +185,68 @@ defmodule Trinox.Protocol do
     end
   end
 
+  defp validate_username(opts) do
+    case Keyword.fetch(opts, :username) do
+      {:ok, username} when is_binary(username) -> :ok
+      {:ok, other} -> invalid(:username, other, "a string")
+      :error -> {:error, %ArgumentError{message: "Trinox requires a :username option"}}
+    end
+  end
+
+  defp validate_scheme(opts) do
+    case Keyword.fetch(opts, :scheme) do
+      {:ok, scheme} when scheme in [:http, :https] -> :ok
+      {:ok, other} -> invalid(:scheme, other, "the atom :http or :https")
+      :error -> :ok
+    end
+  end
+
+  defp validate_hostname(opts) do
+    case Keyword.fetch(opts, :hostname) do
+      {:ok, hostname} when is_binary(hostname) -> validate_bare_host(hostname)
+      {:ok, other} -> invalid(:hostname, other, "a string")
+      :error -> :ok
+    end
+  end
+
+  # `"trino.example.com:8080"` is a URL authority, not a host, and resolves to nothing —
+  # so it is worth saying so rather than retrying DNS until someone reads the logs. One
+  # colon followed by digits is that mistake; an IPv6 address always has at least two.
+  defp validate_bare_host(hostname) do
+    case String.split(hostname, ":") do
+      [host, port] -> bare_host_error(hostname, host, port)
+      _host_or_ipv6 -> :ok
+    end
+  end
+
+  defp bare_host_error(hostname, host, port) do
+    if host != "" and port != "" and match?({_integer, ""}, Integer.parse(port)) do
+      {:error,
+       %ArgumentError{
+         message:
+           "Trinox :hostname must be a host on its own, got #{inspect(hostname)}; " <>
+             "pass #{inspect(host)} as :hostname and #{port} as :port"
+       }}
+    else
+      :ok
+    end
+  end
+
+  defp validate_port(opts) do
+    case Keyword.fetch(opts, :port) do
+      {:ok, port} when is_integer(port) and port > 0 and port < 65_536 -> :ok
+      {:ok, other} -> invalid(:port, other, "a port number")
+      :error -> :ok
+    end
+  end
+
+  defp invalid(key, value, expected) do
+    {:error,
+     %ArgumentError{
+       message: "Trinox #{inspect(key)} must be #{expected}, got #{inspect(value)}"
+     }}
+  end
+
   defp do_connect(username, opts) do
     scheme = Keyword.get(opts, :scheme, :https)
     hostname = Keyword.get(opts, :hostname, "localhost")
@@ -189,12 +271,21 @@ defmodule Trinox.Protocol do
         catalog: Keyword.get(opts, :catalog),
         schema: Keyword.get(opts, :schema)
       },
+      client_opts: client_opts(opts),
       request_opts: Keyword.take(opts, @query_opts)
     }
   end
 
+  defp client_opts(opts) do
+    opts
+    |> Keyword.take(@client_opts)
+    |> Keyword.put_new(:source, @default_source)
+  end
+
   defp request_headers(%__MODULE__{} = state) do
-    Session.build_headers(state.session, user: state.user, password: state.password)
+    opts = [user: state.user, password: state.password] ++ state.client_opts
+
+    Session.build_headers(state.session, opts)
   end
 
   # A per-query option wins over the connection's: the connection sets the house style,

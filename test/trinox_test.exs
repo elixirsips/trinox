@@ -233,6 +233,141 @@ defmodule TrinoxTest do
     end
   end
 
+  describe "transaction/3" do
+    test "runs the statements inside one Trino transaction", %{mock: mock, opts: opts} do
+      conn = connect(opts)
+
+      assert {:ok, :both_done} =
+               Trinox.transaction(conn, fn conn ->
+                 {:ok, _first} = Trinox.query(conn, MockTrino.sql(:single))
+                 {:ok, _second} = Trinox.query(conn, MockTrino.sql(:single))
+                 :both_done
+               end)
+
+      bodies = mock |> MockTrino.requests() |> Enum.map(& &1.body) |> Enum.reject(&(&1 == ""))
+      assert MockTrino.sql(:begin) in bodies
+      assert MockTrino.sql(:commit) in bodies
+
+      # Every request between the two carried the id Trino handed back.
+      inside =
+        mock
+        |> MockTrino.requests()
+        |> Enum.filter(&(&1.body == MockTrino.sql(:single)))
+
+      for request <- inside do
+        assert MockTrino.header(request, "x-trino-transaction-id") == MockTrino.transaction_id()
+      end
+
+      # And the commit cleared it, so the next query is outside the transaction again.
+      {:ok, _result} = Trinox.query(conn, MockTrino.sql(:single))
+      assert MockTrino.header(MockTrino.last_request(mock), "x-trino-transaction-id") == nil
+
+      stop(conn)
+    end
+
+    test "rolls back and re-raises what the function raised", %{mock: mock, opts: opts} do
+      conn = connect(opts)
+
+      assert_raise RuntimeError, "no good", fn ->
+        Trinox.transaction(conn, fn _conn -> raise "no good" end)
+      end
+
+      bodies = mock |> MockTrino.requests() |> Enum.map(& &1.body)
+      assert MockTrino.sql(:rollback) in bodies
+      refute MockTrino.sql(:commit) in bodies
+
+      # The connection is released, so it still works.
+      assert {:ok, %Result{}} = Trinox.query(conn, MockTrino.sql(:single))
+
+      stop(conn)
+    end
+
+    test "rolls back when asked to, and reports the reason", %{mock: mock, opts: opts} do
+      conn = connect(opts)
+
+      assert {:error, :changed_my_mind} =
+               Trinox.transaction(conn, fn conn ->
+                 Trinox.rollback(conn, :changed_my_mind)
+               end)
+
+      assert MockTrino.sql(:rollback) in Enum.map(MockTrino.requests(mock), & &1.body)
+      assert {:ok, %Result{}} = Trinox.query(conn, MockTrino.sql(:single))
+
+      stop(conn)
+    end
+
+    test "refuses to nest", %{opts: opts} do
+      conn = connect(opts)
+
+      assert {:ok, {:error, %Error{message: message}}} =
+               Trinox.transaction(conn, fn conn ->
+                 Trinox.transaction(conn, fn _conn -> :unreachable end)
+               end)
+
+      assert message =~ "already has an open transaction"
+
+      stop(conn)
+    end
+
+    test "refuses a query from any other process", %{opts: opts} do
+      conn = connect(opts)
+
+      assert {:ok, {:error, %Error{message: message}}} =
+               Trinox.transaction(conn, fn conn ->
+                 task = Task.async(fn -> Trinox.query(conn, MockTrino.sql(:single)) end)
+                 Task.await(task)
+               end)
+
+      assert message =~ "owned by another process"
+
+      stop(conn)
+    end
+
+    test "reports a transaction that could not be started" do
+      # A coordinator that refuses the START TRANSACTION itself.
+      conn = MockTrino.start!(fail: [:begin]) |> opts() |> connect()
+
+      assert {:error, %RuntimeError{message: message}} =
+               Trinox.transaction(conn, fn _conn -> :unreachable end, max_attempts: 1)
+
+      assert message =~ "HTTP 503"
+
+      stop(conn)
+    end
+
+    test "reports a commit the coordinator refused, and still hands the connection back" do
+      conn = MockTrino.start!(fail: [:commit]) |> opts() |> connect()
+
+      assert {:error, %RuntimeError{message: message}} =
+               Trinox.transaction(conn, fn _conn -> :done end, max_attempts: 1)
+
+      assert message =~ "HTTP 503"
+
+      # The transaction is over either way, so the connection is no longer reserved.
+      assert {:ok, %Result{}} = Trinox.query(conn, MockTrino.sql(:single))
+
+      stop(conn)
+    end
+
+    test "stops when the process holding the transaction dies", %{opts: opts} do
+      Process.flag(:trap_exit, true)
+      conn = connect(opts)
+
+      # A process that opens a transaction and then abandons it.
+      owner =
+        spawn(fn ->
+          :ok = Trinox.Connection.begin(conn)
+          Process.sleep(:infinity)
+        end)
+
+      assert eventually(fn -> transaction_open?(conn) end)
+
+      Process.exit(owner, :kill)
+
+      assert eventually(fn -> not Process.alive?(conn) end)
+    end
+  end
+
   describe "ping/2" do
     test "checks the connection with the coordinator", %{mock: mock, opts: opts} do
       conn = connect(opts)
@@ -255,5 +390,19 @@ defmodule TrinoxTest do
 
   defp opts(mock) do
     [scheme: :http, hostname: "127.0.0.1", port: mock.port, username: "alice"]
+  end
+
+  # A connection with an owner refuses a query from anyone else, which is how another
+  # process can tell that the transaction has been opened.
+  defp transaction_open?(conn) do
+    match?({:error, %Error{}}, Trinox.query(conn, MockTrino.sql(:single)))
+  end
+
+  defp eventually(fun, attempts \\ 100) do
+    cond do
+      fun.() -> true
+      attempts == 0 -> false
+      true -> Process.sleep(10) || eventually(fun, attempts - 1)
+    end
   end
 end

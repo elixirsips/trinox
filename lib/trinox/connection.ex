@@ -36,10 +36,23 @@ defmodule Trinox.Connection do
   query which runs out of time is *cancelled* — `Trinox.Statement` `DELETE`s it on the
   coordinator — and the connection is free again the moment the caller gives up. A caller
   that simply stopped waiting would have left the query running and the connection busy.
+
+  ## Transactions
+
+  A Trino transaction is a property of the session, not of the socket: `START TRANSACTION`
+  is answered with an id that every later request has to carry. `begin/2`, `commit/2` and
+  `rollback/2` are that exchange, and `Trinox.transaction/3` is what callers should use —
+  it is the part that remembers to end what it started.
+
+  While a transaction is open the connection belongs to the process that opened it, and a
+  query from anywhere else is refused rather than quietly enrolled in someone else's
+  transaction. If that process dies, the transaction is rolled back and the connection
+  stops: what it was in the middle of is no longer anybody's to finish.
   """
 
   use GenServer
 
+  alias Trinox.Error
   alias Trinox.Protocol
   alias Trinox.Result
 
@@ -56,7 +69,7 @@ defmodule Trinox.Connection do
   # comes into play when a connection never picks the call up at all.
   @call_grace_ms 250
 
-  defstruct [:opts, :protocol, :error, :backoff]
+  defstruct [:opts, :protocol, :error, :backoff, :owner]
 
   @typedoc "A connection: the pid `start_link/1` returned, or the `:name` it was given."
   @type conn :: GenServer.server()
@@ -65,7 +78,8 @@ defmodule Trinox.Connection do
            opts: keyword(),
            protocol: Protocol.t() | nil,
            error: Exception.t() | nil,
-           backoff: pos_integer() | nil
+           backoff: pos_integer() | nil,
+           owner: {pid(), reference()} | nil
          }
 
   @doc """
@@ -105,9 +119,38 @@ defmodule Trinox.Connection do
   """
   @spec query(conn(), String.t(), keyword()) :: {:ok, Result.t()} | {:error, Exception.t()}
   def query(conn, statement, opts \\ []) do
-    timeout = Keyword.get(opts, :timeout, :infinity)
+    {deadline, wait} = bounds(opts)
 
-    GenServer.call(conn, {:execute, statement, opts, deadline(timeout)}, call_timeout(timeout))
+    GenServer.call(conn, {:execute, statement, opts, deadline}, wait)
+  end
+
+  @doc """
+  Starts a transaction and makes the calling process the connection's owner.
+
+  `Trinox.transaction/3` calls this; call it yourself only if you are prepared to end the
+  transaction by hand whatever happens.
+  """
+  @spec begin(conn(), keyword()) :: :ok | {:error, Exception.t()}
+  def begin(conn, opts \\ []) do
+    {deadline, wait} = bounds(opts)
+
+    GenServer.call(conn, {:begin, self(), opts, deadline}, wait)
+  end
+
+  @doc "Commits the open transaction and releases the connection."
+  @spec commit(conn(), keyword()) :: :ok | {:error, Exception.t()}
+  def commit(conn, opts \\ []) do
+    {deadline, wait} = bounds(opts)
+
+    GenServer.call(conn, {:finish, "COMMIT", opts, deadline}, wait)
+  end
+
+  @doc "Rolls back the open transaction and releases the connection."
+  @spec rollback(conn(), keyword()) :: :ok | {:error, Exception.t()}
+  def rollback(conn, opts \\ []) do
+    {deadline, wait} = bounds(opts)
+
+    GenServer.call(conn, {:finish, "ROLLBACK", opts, deadline}, wait)
   end
 
   @doc """
@@ -118,7 +161,9 @@ defmodule Trinox.Connection do
   """
   @spec ping(conn(), keyword()) :: :ok | {:error, Exception.t()}
   def ping(conn, opts \\ []) do
-    GenServer.call(conn, :ping, Keyword.get(opts, :timeout, :infinity))
+    {_deadline, wait} = bounds(opts)
+
+    GenServer.call(conn, :ping, wait)
   end
 
   @impl true
@@ -133,6 +178,16 @@ defmodule Trinox.Connection do
   def handle_continue(:connect, state), do: {:noreply, connect(state)}
 
   @impl true
+  def handle_call(
+        {:execute, _statement, _opts, _deadline},
+        {from, _tag},
+        %{owner: {owner, _ref}} = state
+      )
+      when from != owner do
+    {:reply, {:error, borrowed()}, state}
+  end
+
+  @impl true
   def handle_call({:execute, _statement, _opts, _deadline}, _from, %{protocol: nil} = state) do
     {:reply, {:error, state.error}, state}
   end
@@ -142,6 +197,36 @@ defmodule Trinox.Connection do
     state.protocol
     |> Protocol.execute(statement, Keyword.put(opts, :deadline, deadline))
     |> reply(state)
+  end
+
+  @impl true
+  def handle_call({:begin, _owner, _opts, _deadline}, _from, %{owner: {_pid, _ref}} = state) do
+    {:reply, {:error, already_open()}, state}
+  end
+
+  @impl true
+  def handle_call({:begin, _owner, _opts, _deadline}, _from, %{protocol: nil} = state) do
+    {:reply, {:error, state.error}, state}
+  end
+
+  @impl true
+  def handle_call({:begin, owner, opts, deadline}, _from, state) do
+    state.protocol
+    |> Protocol.execute("START TRANSACTION", Keyword.put(opts, :deadline, deadline))
+    |> began(state, owner)
+  end
+
+  @impl true
+  def handle_call({:finish, _statement, _opts, _deadline}, _from, %{owner: nil} = state) do
+    {:reply, {:error, not_open()}, state}
+  end
+
+  @impl true
+  def handle_call({:finish, statement, opts, deadline}, _from, state) do
+    outcome = Protocol.execute(state.protocol, statement, Keyword.put(opts, :deadline, deadline))
+    {_kind, _detail, protocol} = outcome
+
+    finished(outcome, release(state, protocol))
   end
 
   @impl true
@@ -159,6 +244,19 @@ defmodule Trinox.Connection do
 
   @impl true
   def handle_info(:reconnect, state), do: {:noreply, connect(state)}
+
+  @impl true
+  def handle_info({:DOWN, ref, :process, _pid, _reason}, %{owner: {_owner, ref}} = state) do
+    Logger.warning(
+      "Trinox: the process that opened a transaction died; rolling back and stopping"
+    )
+
+    # Nothing is waiting on the rollback, but the protocol it hands back owns the socket
+    # that `terminate/2` still has to close.
+    {_kind, _detail, protocol} = Protocol.execute(state.protocol, "ROLLBACK", [])
+
+    {:stop, :normal, %{state | protocol: protocol, owner: nil}}
+  end
 
   @impl true
   def terminate(_reason, %{protocol: nil}), do: :ok
@@ -188,11 +286,45 @@ defmodule Trinox.Connection do
   defp next_backoff(nil), do: @backoff_min_ms
   defp next_backoff(backoff), do: min(backoff * 2, @backoff_max_ms)
 
-  defp deadline(:infinity), do: :infinity
-  defp deadline(timeout), do: System.monotonic_time(:millisecond) + timeout
+  defp began({:ok, _result, protocol}, state, owner) do
+    {:reply, :ok, %{state | protocol: protocol, owner: {owner, Process.monitor(owner)}}}
+  end
 
-  defp call_timeout(:infinity), do: :infinity
-  defp call_timeout(timeout), do: timeout + @call_grace_ms
+  # Nothing was started, so nothing is owned; the caller gets the failure as it stands.
+  defp began(outcome, state, _owner), do: reply(outcome, state)
+
+  defp finished({:ok, _result, _protocol}, state), do: {:reply, :ok, state}
+  defp finished({:error, reason, _protocol}, state), do: {:reply, {:error, reason}, state}
+  defp finished({:disconnect, reason, _protocol}, state), do: stop(reason, state)
+
+  # The connection is handed back whether the transaction ended well or badly: leaving it
+  # owned by a process that has finished with it is how a connection gets stranded.
+  defp release(%{owner: {_owner, ref}} = state, protocol) do
+    Process.demonitor(ref, [:flush])
+
+    %{state | protocol: protocol, owner: nil}
+  end
+
+  defp borrowed do
+    %Error{message: "this Trinox connection is inside a transaction owned by another process"}
+  end
+
+  defp already_open do
+    %Error{message: "this Trinox connection already has an open transaction"}
+  end
+
+  defp not_open do
+    %Error{message: "this Trinox connection has no open transaction to finish"}
+  end
+
+  # The deadline this connection will hold the query to, and the slightly longer one the
+  # caller waits for, so that the connection's answer arrives before the caller gives up.
+  defp bounds(opts) do
+    case Keyword.get(opts, :timeout, :infinity) do
+      :infinity -> {:infinity, :infinity}
+      timeout -> {System.monotonic_time(:millisecond) + timeout, timeout + @call_grace_ms}
+    end
+  end
 
   defp reply({:ok, result, protocol}, state) do
     {:reply, {:ok, result}, %{state | protocol: protocol}}

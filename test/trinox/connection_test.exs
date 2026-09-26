@@ -39,12 +39,24 @@ defmodule Trinox.ConnectionTest do
 
       assert message =~ ":username"
     end
+
+    test "refuses to start on an option that will never work", %{opts: opts} do
+      Process.flag(:trap_exit, true)
+
+      # A bad option has to be refused here rather than crashing once the process is up:
+      # `start_link/1` has returned by then, and the crash would take the caller with it.
+      assert {:error, %ArgumentError{message: message}} =
+               Connection.start_link(Keyword.put(opts, :scheme, "http"))
+
+      assert message =~ ":scheme"
+      refute_receive {:EXIT, _pid, _reason}
+    end
   end
 
   describe "query/3" do
     setup %{opts: opts} do
       {:ok, conn} = Connection.start_link(opts)
-      on_exit(fn -> stop_if_alive(conn) end)
+
       {:ok, conn: conn}
     end
 
@@ -54,6 +66,8 @@ defmodule Trinox.ConnectionTest do
 
       assert Process.alive?(conn)
       assert {:ok, %Result{}} = Connection.query(conn, MockTrino.sql(:single))
+
+      stop(conn)
     end
 
     test "answers, then stops, when the connection did not survive", %{conn: conn} do
@@ -143,6 +157,17 @@ defmodule Trinox.ConnectionTest do
       assert log =~ "could not connect to Trino"
     end
 
+    test "refuses to start a transaction it cannot start", %{down_opts: down_opts} do
+      capture_log(fn ->
+        {:ok, conn} = Connection.start_link(down_opts)
+
+        assert {:error, %Mint.TransportError{reason: :econnrefused}} =
+                 Trinox.transaction(conn, fn _conn -> :unreachable end)
+
+        stop(conn)
+      end)
+    end
+
     test "keeps retrying, waiting longer each time", %{down_opts: down_opts} do
       log =
         capture_log(fn ->
@@ -181,6 +206,33 @@ defmodule Trinox.ConnectionTest do
     end
   end
 
+  describe "commit/2 and rollback/2 outside a transaction" do
+    test "refuse when there is nothing open", %{opts: opts} do
+      {:ok, conn} = Connection.start_link(opts)
+
+      assert {:error, %Error{message: message}} = Connection.commit(conn)
+      assert message =~ "no open transaction"
+      assert {:error, %Error{}} = Connection.rollback(conn)
+
+      stop(conn)
+    end
+
+    test "stop the connection when committing breaks it", %{mock: mock, opts: opts} do
+      Process.flag(:trap_exit, true)
+      {:ok, conn} = Connection.start_link(opts)
+
+      assert :ok = Connection.begin(conn)
+
+      # The coordinator goes away with the transaction still open, so the COMMIT cannot be
+      # delivered and there is nothing left to hand back.
+      :ok = MockTrino.stop(mock)
+
+      assert {:error, reason} = Connection.commit(conn)
+      assert is_exception(reason)
+      assert_receive {:EXIT, ^conn, :normal}
+    end
+  end
+
   describe "ping/2" do
     test "asks the coordinator for /v1/info", %{mock: mock, opts: opts} do
       {:ok, conn} = Connection.start_link(opts)
@@ -206,8 +258,6 @@ defmodule Trinox.ConnectionTest do
   # The connection goes down with the test process, and so does the mock it is talking
   # to. Stopping it here, while both are still alive, keeps the two in step.
   defp stop(conn), do: :ok = GenServer.stop(conn)
-
-  defp stop_if_alive(conn), do: Process.alive?(conn) && stop(conn)
 
   defp opts(mock) do
     [scheme: :http, hostname: "127.0.0.1", port: mock.port, username: "alice"]

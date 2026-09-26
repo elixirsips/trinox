@@ -153,9 +153,10 @@ defmodule TrinoxTest do
     test "cancels a query that outruns its :timeout and keeps the connection",
          %{mock: mock, opts: opts} do
       conn = connect(opts)
+      assert {:ok, %Result{}} = Trinox.query(conn, MockTrino.sql(:single))
 
       assert {:error, %Error{message: message}} =
-               Trinox.query(conn, MockTrino.sql(:endless), poll_interval_ms: 1_000, timeout: 150)
+               Trinox.query(conn, MockTrino.sql(:endless), poll_interval_ms: 60_000, timeout: 500)
 
       assert message =~ ":timeout"
       assert Enum.any?(MockTrino.requests(mock), &(&1.method == "DELETE"))
@@ -178,9 +179,10 @@ defmodule TrinoxTest do
 
     test "raises when a query is cancelled for running too long", %{opts: opts} do
       conn = connect(opts)
+      assert {:ok, %Result{}} = Trinox.query(conn, MockTrino.sql(:single))
 
       assert_raise Error, ~r/:timeout/, fn ->
-        Trinox.query!(conn, MockTrino.sql(:endless), poll_interval_ms: 1_000, timeout: 150)
+        Trinox.query!(conn, MockTrino.sql(:endless), poll_interval_ms: 60_000, timeout: 500)
       end
 
       stop(conn)

@@ -134,10 +134,15 @@ defmodule Trinox.StatementTest do
   describe "run/4 deadlines" do
     test "cancels the query and stops polling once the deadline passes",
          %{mock: mock, conn: conn} do
+      # Warm the connection first: the deadline caps the timeout of the request it covers,
+      # so a cold first POST on a loaded machine can eat the budget before there is a query
+      # to cancel at all.
+      {:ok, conn, _warm, _headers} = Statement.run(conn, MockTrino.sql(:single), @headers, [])
+
       assert {:error, conn, %Error{message: message}} =
                Statement.run(conn, MockTrino.sql(:endless), @headers,
-                 poll_interval_ms: 1_000,
-                 deadline: in_ms(150)
+                 poll_interval_ms: 60_000,
+                 deadline: in_ms(500)
                )
 
       assert message =~ ":timeout"
@@ -163,13 +168,18 @@ defmodule Trinox.StatementTest do
     test "caps :receive_timeout at the time the deadline has left", %{conn: conn} do
       # :slow answers after 100ms, and a receive timeout of a whole second would happily
       # wait for it — but the deadline says there are only 10ms to spend.
-      assert {:error, _conn, reason} =
+      started = System.monotonic_time(:millisecond)
+
+      assert {:error, _conn, %Error{message: message}} =
                Statement.run(conn, MockTrino.sql(:slow), @headers,
                  receive_timeout: 1_000,
                  deadline: in_ms(10)
                )
 
-      assert %Mint.TransportError{reason: :timeout} = reason
+      # It gave up on its own deadline rather than on the receive timeout it was given,
+      # and says so as a deadline rather than as whatever the socket reported.
+      assert System.monotonic_time(:millisecond) - started < 100
+      assert message =~ ":timeout"
     end
 
     test "does not wait out a poll interval that runs past the deadline", %{conn: conn} do
@@ -177,8 +187,8 @@ defmodule Trinox.StatementTest do
 
       assert {:error, _conn, %Error{}} =
                Statement.run(conn, MockTrino.sql(:endless), @headers,
-                 poll_interval_ms: 10_000,
-                 deadline: in_ms(150)
+                 poll_interval_ms: 60_000,
+                 deadline: in_ms(500)
                )
 
       # A full interval would have been ten seconds; the deadline cut it to fifty
@@ -243,10 +253,10 @@ defmodule Trinox.StatementTest do
                  deadline: in_ms(120)
                )
 
-      # The deadline either ended a wait between tries, giving the cancellation error, or
-      # cut short the request it was in the middle of. Either way what matters is that it
-      # stopped: a hundred attempts would have taken the better part of a minute.
-      assert is_exception(reason)
+      # Whether the deadline ended a wait between tries or cut short the request it was in
+      # the middle of, it reports as the deadline. What matters is that it stopped: a
+      # hundred attempts would have taken the better part of a minute.
+      assert %Error{} = reason
       assert length(MockTrino.requests(mock)) < 10
     end
   end

@@ -86,13 +86,18 @@ defmodule Trinox.ConnectionTest do
          %{mock: mock, opts: opts} do
       {:ok, conn} = Connection.start_link(opts)
 
+      # Warm the connection first: a deadline caps the timeout of the request it covers, so
+      # a cold first POST on a loaded machine can eat the budget before there is a query to
+      # cancel at all.
+      assert {:ok, %Result{}} = Connection.query(conn, MockTrino.sql(:single))
+
       # :endless never reaches a terminal page, so only the deadline can end it. The poll
       # interval is longer than the deadline on purpose: it gets clamped to what is left,
-      # so the run is exactly the POST and the DELETE that cancels it.
+      # so the run adds exactly the POST and the DELETE that cancels it.
       assert {:error, %Error{message: message}} =
                Connection.query(conn, MockTrino.sql(:endless),
-                 poll_interval_ms: 1_000,
-                 timeout: 150
+                 poll_interval_ms: 60_000,
+                 timeout: 500
                )
 
       assert message =~ ":timeout"
@@ -110,13 +115,14 @@ defmodule Trinox.ConnectionTest do
     test "answers the caller rather than making it give up", %{opts: opts} do
       Process.flag(:trap_exit, true)
       {:ok, conn} = Connection.start_link(opts)
+      assert {:ok, %Result{}} = Connection.query(conn, MockTrino.sql(:single))
 
       # The connection enforces the deadline itself, so the caller's own call outlives it
       # and receives the error instead of exiting on a timeout of its own.
       assert {:error, %Error{}} =
                Connection.query(conn, MockTrino.sql(:endless),
-                 poll_interval_ms: 1_000,
-                 timeout: 150
+                 poll_interval_ms: 60_000,
+                 timeout: 500
                )
 
       stop(conn)

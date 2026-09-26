@@ -39,6 +39,11 @@ defmodule Trinox.Statement do
   cancelled with a `DELETE` of its `nextUri` — which is how Trino is told to stop work —
   and the run returns a `Trinox.Error`. The connection itself is untouched and usable for
   the next query, which is the whole point of cancelling rather than hanging up.
+
+  A deadline also caps each request's own timeout, so it can fall due in the middle of one
+  rather than between two. That reads the same to a caller — the same `Trinox.Error` — but
+  there is no cancelling a query over a connection that is halfway through reading a
+  response, so the connection does not survive that one.
   """
 
   alias Trinox.Error
@@ -115,9 +120,24 @@ defmodule Trinox.Statement do
   defp send_request(conn, context, {method, path, body} = request, pages, tries) do
     case HTTP.request(conn, method, path, context.headers, body, request_opts(context.opts)) do
       {:ok, conn, response} -> received(conn, context, request, pages, tries, response)
-      {:error, conn, reason} -> {:error, conn, reason}
+      {:error, conn, reason} -> failed(conn, context, reason)
     end
   end
+
+  # A request only times out on its own clock once the deadline has taken that clock over,
+  # so a timeout with nothing left to spend is the deadline speaking through the transport.
+  # Reporting it as the deadline gives a caller one error to match on however the time ran
+  # out — whether between polls, where the query can still be cancelled, or mid-request,
+  # where a half-read connection means there is nothing left to cancel it on.
+  defp failed(conn, context, %Mint.TransportError{reason: :timeout} = reason) do
+    if expired?(context.opts) do
+      {:error, conn, timeout_error()}
+    else
+      {:error, conn, reason}
+    end
+  end
+
+  defp failed(conn, _context, reason), do: {:error, conn, reason}
 
   defp received(conn, context, _request, pages, _tries, %{status: status} = response)
        when status in 200..299 do

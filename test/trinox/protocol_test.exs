@@ -5,7 +5,6 @@ defmodule Trinox.ProtocolTest do
   alias Trinox.HTTP
   alias Trinox.MockTrino
   alias Trinox.Protocol
-  alias Trinox.Query
   alias Trinox.Result
   alias Trinox.Session
 
@@ -129,43 +128,40 @@ defmodule Trinox.ProtocolTest do
     end
   end
 
-  describe "checkout/1" do
-    test "hands over an open connection", %{opts: opts} do
+  describe "open?/1" do
+    test "reports whether the connection is still usable", %{opts: opts} do
       {:ok, state} = Protocol.connect(opts)
 
-      assert {:ok, ^state} = Protocol.checkout(state)
-    end
+      assert Protocol.open?(state)
 
-    test "disconnects a closed connection so the pool replaces it", %{opts: opts} do
-      {:ok, state} = Protocol.connect(opts)
       {:ok, conn} = HTTP.close(state.conn)
 
-      assert {:disconnect, %RuntimeError{message: message}, _state} =
-               Protocol.checkout(%{state | conn: conn})
-
-      assert message =~ "closed"
+      refute Protocol.open?(%{state | conn: conn})
     end
   end
 
-  describe "disconnect/2" do
+  describe "close/1" do
     test "closes the connection", %{opts: opts} do
       {:ok, state} = Protocol.connect(opts)
 
-      assert :ok = Protocol.disconnect(%RuntimeError{message: "stopping"}, state)
+      assert :ok = Protocol.close(state)
+
+      # Mint connections are immutable, so the struct we still hold says "open" while the
+      # socket under it is gone; a request on it is what notices.
+      assert {:error, _conn, %Mint.TransportError{reason: :closed}} =
+               HTTP.request(state.conn, "GET", "/v1/info", [], nil)
     end
   end
 
-  describe "handle_execute/4" do
+  describe "execute/3" do
     setup %{opts: opts} do
       {:ok, state} = Protocol.connect(opts)
       {:ok, state: state}
     end
 
     test "runs a statement to completion and decodes the result", %{mock: mock, state: state} do
-      query = query(:single)
-
-      assert {:ok, ^query, %Result{} = result, _state} =
-               Protocol.handle_execute(query, [], [], state)
+      assert {:ok, %Result{} = result, _state} =
+               Protocol.execute(state, statement(:single), [])
 
       assert result.columns == ["id", "name"]
       assert result.rows == [[1, "one"]]
@@ -181,8 +177,7 @@ defmodule Trinox.ProtocolTest do
       {:ok, state} =
         Protocol.connect(opts ++ [password: "secret", catalog: "tpch", schema: "sf1"])
 
-      assert {:ok, _query, %Result{}, _state} =
-               Protocol.handle_execute(query(:multi_page), [], [], state)
+      assert {:ok, %Result{}, _state} = Protocol.execute(state, statement(:multi_page), [])
 
       for request <- MockTrino.requests(mock) do
         assert MockTrino.header(request, "authorization") ==
@@ -195,8 +190,7 @@ defmodule Trinox.ProtocolTest do
     end
 
     test "folds the session headers of every page back into the state", %{state: state} do
-      assert {:ok, _query, %Result{}, state} =
-               Protocol.handle_execute(query(:session), [], [], state)
+      assert {:ok, %Result{}, state} = Protocol.execute(state, statement(:session), [])
 
       # The catalog, schema and first property come from the POST response; the second
       # property only from the terminal page.
@@ -210,15 +204,14 @@ defmodule Trinox.ProtocolTest do
     test "applies a session property the coordinator cleared", %{state: state} do
       state = %{state | session: %Session{properties: %{"mock_scenario" => "session"}}}
 
-      assert {:ok, _query, %Result{}, state} =
-               Protocol.handle_execute(query(:clear_session), [], [], state)
+      assert {:ok, %Result{}, state} = Protocol.execute(state, statement(:clear_session), [])
 
       assert state.session.properties == %{}
     end
 
     test "echoes the updated session on the next query", %{mock: mock, state: state} do
-      {:ok, _query, %Result{}, state} = Protocol.handle_execute(query(:session), [], [], state)
-      {:ok, _query, %Result{}, _state} = Protocol.handle_execute(query(:single), [], [], state)
+      {:ok, %Result{}, state} = Protocol.execute(state, statement(:session), [])
+      {:ok, %Result{}, _state} = Protocol.execute(state, statement(:single), [])
 
       request = MockTrino.last_request(mock)
 
@@ -235,11 +228,11 @@ defmodule Trinox.ProtocolTest do
       # The connection would have waited five seconds; the query gives up after one
       # millisecond, and a half-read response leaves nothing to reuse the socket for.
       assert {:disconnect, %Mint.TransportError{reason: :timeout}, _state} =
-               Protocol.handle_execute(query(:slow), [], [receive_timeout: 1], state)
+               Protocol.execute(state, statement(:slow), receive_timeout: 1)
     end
   end
 
-  describe "handle_execute/4 failures" do
+  describe "execute/3 failures" do
     setup %{opts: opts} do
       {:ok, state} = Protocol.connect(opts)
       {:ok, state: state}
@@ -247,7 +240,7 @@ defmodule Trinox.ProtocolTest do
 
     test "returns a Trinox.Error for a query Trino refused", %{state: state} do
       assert {:error, %Error{} = error, state} =
-               Protocol.handle_execute(query(:error), [], [], state)
+               Protocol.execute(state, statement(:error), [])
 
       assert error.message =~ "Table 'mock.default.boom' does not exist"
       assert error.error_code == 44
@@ -261,133 +254,26 @@ defmodule Trinox.ProtocolTest do
 
     test "keeps the connection when the coordinator answers badly", %{state: state} do
       assert {:error, %RuntimeError{message: message}, state} =
-               Protocol.handle_execute(query(:unavailable), [], [], state)
+               Protocol.execute(state, statement(:unavailable), [])
 
       assert message =~ "HTTP 503"
       assert HTTP.open?(state.conn)
 
       assert {:error, %Jason.DecodeError{}, state} =
-               Protocol.handle_execute(query(:invalid_json), [], [], state)
+               Protocol.execute(state, statement(:invalid_json), [])
 
       assert HTTP.open?(state.conn)
     end
 
     test "disconnects when the connection did not survive the query", %{state: state} do
       assert {:disconnect, %Mint.HTTPError{reason: :closed}, _state} =
-               Protocol.handle_execute(query(:closing), [], [], state)
+               Protocol.execute(state, statement(:closing), [])
     end
   end
 
-  describe "callbacks with nothing to do" do
-    setup %{opts: opts} do
-      {:ok, state} = Protocol.connect(opts)
-      {:ok, state: state}
-    end
-
-    test "handle_prepare/3 hands the query straight back", %{state: state} do
-      query = query(:single)
-
-      assert {:ok, ^query, ^state} = Protocol.handle_prepare(query, [], state)
-    end
-
-    test "handle_close/3 has nothing to close", %{state: state} do
-      assert {:ok, nil, ^state} = Protocol.handle_close(query(:single), [], state)
-    end
-
-    test "the cursor callbacks refuse with a Trinox.Error", %{state: state} do
-      query = query(:single)
-
-      results = [
-        Protocol.handle_declare(query, [], [], state),
-        Protocol.handle_fetch(query, :cursor, [], state),
-        Protocol.handle_deallocate(query, :cursor, [], state)
-      ]
-
-      for result <- results do
-        assert {:error, %Error{message: message}, ^state} = result
-        assert message =~ "cursors"
-      end
-    end
-
-    test "the transaction callbacks report the :error status", %{state: state} do
-      assert {:error, ^state} = Protocol.handle_begin([], state)
-      assert {:error, ^state} = Protocol.handle_commit([], state)
-      assert {:error, ^state} = Protocol.handle_rollback([], state)
-    end
-
-    test "handle_status/2 always reports :idle", %{state: state} do
-      assert {:idle, ^state} = Protocol.handle_status([], state)
-    end
-  end
-
-  describe "under DBConnection" do
-    test "starts a pool and pings the coordinator while idle", %{mock: mock, opts: opts} do
-      {:ok, pool} =
-        DBConnection.start_link(Protocol, opts ++ [pool_size: 1, idle_interval: 10])
-
-      assert is_pid(pool)
-      assert eventually(fn -> Enum.any?(MockTrino.requests(mock), &(&1.path == "/v1/info")) end)
-
-      # Stop pinging before the mock goes away with the test process.
-      :ok = GenServer.stop(pool)
-    end
-
-    test "executes a query and returns a result", %{mock: mock, opts: opts} do
-      {:ok, pool} = DBConnection.start_link(Protocol, opts ++ [pool_size: 1])
-
-      assert {:ok, _query, %Result{} = result} =
-               DBConnection.execute(pool, query(:single), [])
-
-      assert result.columns == ["id", "name"]
-      assert result.rows == [[1, "one"]]
-      assert [%{method: "POST"}, %{method: "GET"}] = MockTrino.requests(mock)
-
-      :ok = GenServer.stop(pool)
-    end
-
-    test "prepares and executes in one call", %{mock: mock, opts: opts} do
-      {:ok, pool} = DBConnection.start_link(Protocol, opts ++ [pool_size: 1])
-
-      assert {:ok, _query, %Result{rows: [[1, "one"]]}} =
-               DBConnection.prepare_execute(pool, query(:single), [])
-
-      # Preparing costs nothing: the POST is still the first request the mock sees.
-      assert [%{method: "POST"} | _polls] = MockTrino.requests(mock)
-
-      :ok = GenServer.stop(pool)
-    end
-
-    test "returns a Trinox.Error for a query Trino refused", %{opts: opts} do
-      {:ok, pool} = DBConnection.start_link(Protocol, opts ++ [pool_size: 1])
-
-      assert {:error, %Error{error_name: "TABLE_NOT_FOUND"}} =
-               DBConnection.execute(pool, query(:error), [])
-
-      :ok = GenServer.stop(pool)
-    end
-
-    test "reports that transactions are not supported", %{opts: opts} do
-      {:ok, pool} = DBConnection.start_link(Protocol, opts ++ [pool_size: 1])
-
-      # handle_begin/2's :error status reaches the caller as a rolled-back transaction.
-      assert {:error, :rollback} =
-               DBConnection.transaction(pool, fn _conn -> :unreachable end)
-
-      :ok = GenServer.stop(pool)
-    end
-  end
-
-  defp query(scenario), do: %Query{statement: MockTrino.sql(scenario)}
+  defp statement(scenario), do: MockTrino.sql(scenario)
 
   defp opts(mock) do
     [scheme: :http, hostname: "127.0.0.1", port: mock.port, username: "alice"]
-  end
-
-  defp eventually(fun, attempts \\ 100) do
-    cond do
-      fun.() -> true
-      attempts == 0 -> false
-      true -> Process.sleep(10) || eventually(fun, attempts - 1)
-    end
   end
 end

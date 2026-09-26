@@ -1,6 +1,7 @@
 defmodule Trinox.StatementTest do
   use ExUnit.Case, async: true
 
+  alias Trinox.Error
   alias Trinox.HTTP
   alias Trinox.MockTrino
   alias Trinox.Statement
@@ -130,6 +131,62 @@ defmodule Trinox.StatementTest do
     end
   end
 
+  describe "run/4 deadlines" do
+    test "cancels the query and stops polling once the deadline passes",
+         %{mock: mock, conn: conn} do
+      assert {:error, conn, %Error{message: message}} =
+               Statement.run(conn, MockTrino.sql(:endless), @headers,
+                 poll_interval_ms: 1_000,
+                 deadline: in_ms(150)
+               )
+
+      assert message =~ ":timeout"
+
+      # The nextUri it had reached was DELETEd, which is how Trino is told to stop.
+      assert [%{method: "DELETE", path: path} | _earlier] =
+               mock |> MockTrino.requests() |> Enum.reverse()
+
+      assert path =~ "/v1/statement/endless/"
+
+      # The cancel is a complete request/response, so the connection lives on.
+      assert HTTP.open?(conn)
+    end
+
+    test "submits nothing at all when the deadline has already passed",
+         %{mock: mock, conn: conn} do
+      assert {:error, _conn, %Error{}} =
+               Statement.run(conn, MockTrino.sql(:single), @headers, deadline: in_ms(0))
+
+      assert MockTrino.requests(mock) == []
+    end
+
+    test "caps :receive_timeout at the time the deadline has left", %{conn: conn} do
+      # :slow answers after 100ms, and a receive timeout of a whole second would happily
+      # wait for it — but the deadline says there are only 10ms to spend.
+      assert {:error, _conn, reason} =
+               Statement.run(conn, MockTrino.sql(:slow), @headers,
+                 receive_timeout: 1_000,
+                 deadline: in_ms(10)
+               )
+
+      assert %Mint.TransportError{reason: :timeout} = reason
+    end
+
+    test "does not wait out a poll interval that runs past the deadline", %{conn: conn} do
+      started = System.monotonic_time(:millisecond)
+
+      assert {:error, _conn, %Error{}} =
+               Statement.run(conn, MockTrino.sql(:endless), @headers,
+                 poll_interval_ms: 10_000,
+                 deadline: in_ms(150)
+               )
+
+      # A full interval would have been ten seconds; the deadline cut it to fifty
+      # milliseconds and a bit.
+      assert System.monotonic_time(:millisecond) - started < 1_000
+    end
+  end
+
   describe "run/4 failures" do
     test "returns the transport error when the POST cannot be sent", %{conn: conn} do
       {:ok, conn} = HTTP.close(conn)
@@ -179,4 +236,6 @@ defmodule Trinox.StatementTest do
              })
     end
   end
+
+  defp in_ms(milliseconds), do: System.monotonic_time(:millisecond) + milliseconds
 end

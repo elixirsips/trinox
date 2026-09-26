@@ -28,6 +28,12 @@ defmodule Trinox.MockTrino do
       `:single`.
     * `:closing` — the `POST` is answered with `Connection: close`, so the connection is
       gone by the time the poll is sent and the poll fails outright.
+    * `:endless` — every page carries a `nextUri`, so the query never reaches a terminal
+      page. This is the query that only a deadline can end.
+
+  `DELETE`ing a `nextUri` is how a client cancels a running query, and the mock answers
+  `204` to one like a coordinator does. The `DELETE` is recorded like any other request,
+  so a test can assert that an abandoned query was actually cancelled.
 
   `:multi_page` hands back a `nextUri` carrying a query string, since a `nextUri` is
   opaque and has to be followed exactly as given.
@@ -68,7 +74,8 @@ defmodule Trinox.MockTrino do
     "unavailable" => "SELECT * FROM unavailable",
     "invalid_json" => "SELECT * FROM garbage",
     "slow" => "SELECT * FROM slow",
-    "closing" => "SELECT * FROM closing"
+    "closing" => "SELECT * FROM closing",
+    "endless" => "SELECT * FROM endless"
   }
 
   @doc """
@@ -80,6 +87,8 @@ defmodule Trinox.MockTrino do
       passed through to `Bandit`.
     * `:info_status` — the status `GET /v1/info` answers with (default `200`), for
       simulating a coordinator that is unreachable or still starting.
+    * `:port` — the port to listen on (default `0`, an ephemeral one). Pin it to bring a
+      coordinator back up where one was before.
   """
   @spec start!(keyword()) :: t()
   def start!(opts \\ []) do
@@ -95,7 +104,7 @@ defmodule Trinox.MockTrino do
           port: 0,
           startup_log: false
         ],
-        Keyword.take(opts, [:scheme, :certfile, :keyfile])
+        Keyword.take(opts, [:scheme, :certfile, :keyfile, :port])
       )
 
     {:ok, server} = Bandit.start_link(bandit_opts)
@@ -209,6 +218,12 @@ defmodule Trinox.MockTrino do
       |> respond(scenario, String.to_integer(token))
     end
 
+    delete "/v1/statement/*_next_uri" do
+      conn
+      |> record("")
+      |> send_resp(204, "")
+    end
+
     get "/v1/info" do
       info = %{
         "coordinator" => true,
@@ -243,7 +258,12 @@ defmodule Trinox.MockTrino do
         body: body
       }
 
-      Agent.update(Keyword.fetch!(conn.assigns.mock_trino, :recorder), &[request | &1])
+      recorder = Keyword.fetch!(conn.assigns.mock_trino, :recorder)
+
+      # A cancelled or slow request can still be in flight when the test that started the
+      # mock ends, and the recorder goes down with it. There is nobody left to record for.
+      if Process.alive?(recorder), do: Agent.update(recorder, &[request | &1])
+
       conn
     end
 
@@ -283,6 +303,9 @@ defmodule Trinox.MockTrino do
     # A nextUri the client can never follow: Bandit closes the connection after this
     # response, so the poll fails on a dead socket instead of on a stopwatch.
     defp page("closing", 0), do: with_headers(queued(), [{"connection", "close"}])
+    # No token ever terminates: the only way out of this query is a deadline.
+    defp page("endless", _token), do: more(%{"columns" => columns(), "data" => []})
+
     defp page(_scenario, 0), do: queued()
 
     defp page("multi_page", 1), do: more(%{"columns" => columns(), "data" => [[1, "one"]]})

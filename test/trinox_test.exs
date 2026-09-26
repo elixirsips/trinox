@@ -3,10 +3,7 @@ defmodule TrinoxTest do
 
   alias Trinox.Error
   alias Trinox.MockTrino
-  alias Trinox.Query
   alias Trinox.Result
-
-  doctest Trinox.Query
 
   setup do
     mock = MockTrino.start!()
@@ -23,8 +20,8 @@ defmodule TrinoxTest do
       stop(conn)
     end
 
-    test "passes the pool options on to DBConnection", %{opts: opts} do
-      assert {:ok, conn} = Trinox.start_link(opts ++ [name: :trinox_named_test, pool_size: 2])
+    test "passes the process options on to the connection", %{opts: opts} do
+      assert {:ok, conn} = Trinox.start_link(opts ++ [name: :trinox_named_test])
 
       assert {:ok, %Result{}} = Trinox.query(:trinox_named_test, MockTrino.sql(:single))
 
@@ -40,6 +37,22 @@ defmodule TrinoxTest do
 
       assert {:ok, %Result{rows: [[1, "one"]]}} =
                Trinox.query(:trinox_supervised_test, MockTrino.sql(:single))
+
+      :ok = Supervisor.stop(supervisor)
+    end
+
+    test "starts several connections side by side", %{opts: opts} do
+      # Concurrency here means more connections, so the specs of two of them have to be
+      # able to live in one supervisor without being told apart by hand.
+      children = [
+        {Trinox, opts ++ [name: :trinox_side_by_side_a]},
+        {Trinox, opts ++ [name: :trinox_side_by_side_b]}
+      ]
+
+      assert {:ok, supervisor} = Supervisor.start_link(children, strategy: :one_for_one)
+
+      assert {:ok, %Result{}} = Trinox.query(:trinox_side_by_side_a, MockTrino.sql(:single))
+      assert {:ok, %Result{}} = Trinox.query(:trinox_side_by_side_b, MockTrino.sql(:single))
 
       :ok = Supervisor.stop(supervisor)
     end
@@ -130,6 +143,26 @@ defmodule TrinoxTest do
       assert {:error, %Mint.TransportError{reason: :timeout}} =
                Trinox.query(conn, MockTrino.sql(:slow), receive_timeout: 1)
 
+      # A half-read response leaves nothing to reuse the socket for, so the connection
+      # stops itself once the caller has the error; there is nothing left to stop here.
+      refute Process.alive?(conn)
+    end
+  end
+
+  describe "query/3 timeouts" do
+    test "cancels a query that outruns its :timeout and keeps the connection",
+         %{mock: mock, opts: opts} do
+      conn = connect(opts)
+
+      assert {:error, %Error{message: message}} =
+               Trinox.query(conn, MockTrino.sql(:endless), poll_interval_ms: 1_000, timeout: 150)
+
+      assert message =~ ":timeout"
+      assert Enum.any?(MockTrino.requests(mock), &(&1.method == "DELETE"))
+
+      # The caller gets an error rather than an exit, and the connection is still good.
+      assert {:ok, %Result{}} = Trinox.query(conn, MockTrino.sql(:single))
+
       stop(conn)
     end
   end
@@ -139,6 +172,16 @@ defmodule TrinoxTest do
       conn = connect(opts)
 
       assert %Result{rows: [[1, "one"]]} = Trinox.query!(conn, MockTrino.sql(:single))
+
+      stop(conn)
+    end
+
+    test "raises when a query is cancelled for running too long", %{opts: opts} do
+      conn = connect(opts)
+
+      assert_raise Error, ~r/:timeout/, fn ->
+        Trinox.query!(conn, MockTrino.sql(:endless), poll_interval_ms: 1_000, timeout: 150)
+      end
 
       stop(conn)
     end
@@ -190,28 +233,24 @@ defmodule TrinoxTest do
     end
   end
 
-  describe "Trinox.Query" do
-    test "refuses parameters it cannot bind", %{opts: opts} do
+  describe "ping/2" do
+    test "checks the connection with the coordinator", %{mock: mock, opts: opts} do
       conn = connect(opts)
-      query = %Query{statement: MockTrino.sql(:single)}
 
-      assert_raise ArgumentError, ~r/does not support query parameters/, fn ->
-        DBConnection.prepare_execute(conn, query, [1, 2])
-      end
+      assert :ok = Trinox.ping(conn)
+      assert MockTrino.last_request(mock).path == "/v1/info"
 
       stop(conn)
     end
   end
 
-  # A pool of one, so that the session one query picked up is still there for the next.
   defp connect(opts, extra \\ []) do
-    {:ok, conn} = Trinox.start_link(opts ++ [pool_size: 1] ++ extra)
+    {:ok, conn} = Trinox.start_link(opts ++ extra)
     conn
   end
 
-  # The pool goes down with the test process, and so does the mock it is talking to.
-  # Stopping it here, while both are still alive, is what keeps an idle ping from
-  # outliving the coordinator it would ping.
+  # The connection goes down with the test process, and so does the mock it is talking
+  # to. Stopping it here, while both are still alive, keeps the two in step.
   defp stop(conn), do: :ok = GenServer.stop(conn)
 
   defp opts(mock) do
